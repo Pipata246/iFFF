@@ -32,6 +32,30 @@ const {
  */
 const MAX_RUN_ATTEMPTS_MIN = 15;
 
+/** После сбоя DOM на выдаче — следующий runAttempt откроет этот URL. */
+let resumeListingUrl = null;
+/** Номер страницы выдачи (1-based), соответствующий сохранённому URL. */
+let resumeSerpPageIndex = null;
+
+/**
+ * Номер страницы выдачи из query ?p= (у Avito вторая страница обычно p=2).
+ * @param {string} urlStr
+ * @returns {number}
+ */
+function parseSerpPageIndexFromUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    const p = u.searchParams.get('p');
+    if (p != null && p !== '') {
+      const n = parseInt(p, 10);
+      if (Number.isFinite(n) && n >= 1) return n;
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  return 1;
+}
+
 /** Параметры filterListings из collectParams */
 function listingsFilterOpts(params) {
   return {
@@ -180,9 +204,16 @@ const ITEM_SELECTOR = '[data-marker="item"]';
  * @param {string} pageLabel
  * @param {{ onIpBlock: () => never }} hooks
  * @param {{ isFirstPage?: boolean }} [options]
+ * @param {{ onDomGateFailedAutoClose?: () => void }} [flow] — после исчерпания перезагрузок DOM: закрыть браузер без Enter (main запустит новый)
  */
-async function gateListingPageReady(page, pageLabel, hooks, options = {}) {
+async function gateListingPageReady(page, pageLabel, hooks, options = {}, flow) {
   const isFirstPage = options.isFirstPage === true;
+
+  const markDomGateFailedAutoClose = () => {
+    if (flow && typeof flow.onDomGateFailedAutoClose === 'function') {
+      flow.onDomGateFailedAutoClose();
+    }
+  };
 
   if (isFirstPage) {
     logStep(
@@ -245,6 +276,7 @@ async function gateListingPageReady(page, pageLabel, hooks, options = {}) {
             hooks.onIpBlock();
           }
           if (st >= 400) {
+            markDomGateFailedAutoClose();
             throw new Error(`Перезагрузка Avito: HTTP ${st}`);
           }
         }
@@ -285,6 +317,7 @@ async function gateListingPageReady(page, pageLabel, hooks, options = {}) {
         log(
           `  [${pageLabel}] карточек нет после ${MAX_DOM_RELOAD_ATTEMPTS} перезагрузок вкладки`
         );
+        markDomGateFailedAutoClose();
         throw new Error(
           'На странице не появились объявления за отведённое время. Проверьте прокси, запрос или вёрстку Avito.'
         );
@@ -297,6 +330,7 @@ async function gateListingPageReady(page, pageLabel, hooks, options = {}) {
         log(`  [${pageLabel}] карточек нет — одна перезагрузка вкладки на случай медленной подгрузки JS…`);
         continue;
       }
+      markDomGateFailedAutoClose();
       throw new Error(
         'На странице не появились объявления за отведённое время. Проверьте прокси, запрос или вёрстку Avito.'
       );
@@ -304,6 +338,7 @@ async function gateListingPageReady(page, pageLabel, hooks, options = {}) {
   }
 
   if (!gotCards) {
+    markDomGateFailedAutoClose();
     throw new Error(
       'На странице не появились объявления за отведённое время. Проверьте прокси, запрос или вёрстку Avito.'
     );
@@ -689,7 +724,9 @@ async function runAttempt(params) {
   /** При IP_BLOCK закрываем Chromium сразу, без Enter — дальше пауза на ротацию прокси */
   let skipEnterBeforeClose = false;
 
-  const url = buildSearchUrl({
+  const domGateCtx = { page: /** @type {import('playwright').Page | null} */ (null) };
+
+  const builtSearchUrl = buildSearchUrl({
     query: params.query,
     extraKeywords: params.extraKeywords,
     city: params.city,
@@ -697,6 +734,21 @@ async function runAttempt(params) {
     maxPrice: params.maxPrice,
     sellerType: params.sellerType,
   });
+
+  const openingFromResume = resumeListingUrl != null;
+  const openUrl = openingFromResume ? resumeListingUrl : builtSearchUrl;
+  /** @type {number|null} */
+  let savedResumePageIdx = null;
+  if (openingFromResume) {
+    savedResumePageIdx = resumeSerpPageIndex;
+    resumeListingUrl = null;
+    resumeSerpPageIndex = null;
+    log(
+      `  Возобновление: открываем сохранённый URL страницы выдачи${savedResumePageIdx != null ? ` (стр. ${savedResumePageIdx})` : ''}.`
+    );
+  }
+
+  const crawlState = { serpPageIndex: 1 };
 
   logStep(
     1,
@@ -710,6 +762,7 @@ async function runAttempt(params) {
 
   logStep(3, 'Открыта новая вкладка', '');
   const page = await context.newPage();
+  domGateCtx.page = page;
 
   await waitProxyManualGate();
 
@@ -717,6 +770,27 @@ async function runAttempt(params) {
     onIpBlock() {
       skipEnterBeforeClose = true;
       throw new Error('IP_BLOCK');
+    },
+  };
+
+  const domGateFlow = {
+    onDomGateFailedAutoClose() {
+      skipEnterBeforeClose = true;
+      try {
+        const p = domGateCtx.page;
+        if (p) {
+          resumeListingUrl = p.url();
+          resumeSerpPageIndex = crawlState.serpPageIndex;
+          log(
+            `  Запомнили для следующей попытки: стр. ${resumeSerpPageIndex} — ${resumeListingUrl}`
+          );
+        }
+      } catch (_) {
+        /* ignore */
+      }
+      log(
+        '  Выдача не поднялась после перезагрузок вкладки — закрываем Chromium без паузы Enter; следующая попытка откроет этот же адрес выдачи.'
+      );
     },
   };
 
@@ -728,7 +802,7 @@ async function runAttempt(params) {
     log('  короткая пауза перед переходом по ссылке…');
     await randomDelay(SOFT.beforeGotoMin, SOFT.beforeGotoMax);
 
-    logStep(4, 'Адрес поиска Avito', url);
+    logStep(4, 'Адрес поиска Avito', openUrl);
     logStep(
       5,
       'Переход на Avito',
@@ -736,7 +810,7 @@ async function runAttempt(params) {
     );
 
     try {
-      const response = await page.goto(url, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
+      const response = await page.goto(openUrl, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
       if (response) {
         const st = response.status();
         if (st === 403 || st === 429) {
@@ -766,7 +840,27 @@ async function runAttempt(params) {
     }
 
     log('  после перехода: load, капча и карточки — единая проверка (шаги 6–8 в логе)');
-    await gateListingPageReady(page, 'страница выдачи 1', ipHooks, { isFirstPage: true });
+    crawlState.serpPageIndex = savedResumePageIdx != null ? savedResumePageIdx : 1;
+    await gateListingPageReady(
+      page,
+      openingFromResume ? 'возобновление сохранённой выдачи' : 'страница выдачи 1',
+      ipHooks,
+      { isFirstPage: true },
+      domGateFlow
+    );
+
+    let listingPageIdx =
+      savedResumePageIdx != null
+        ? savedResumePageIdx
+        : openingFromResume
+          ? parseSerpPageIndexFromUrl(page.url())
+          : 1;
+    if (!openingFromResume) {
+      listingPageIdx = 1;
+    } else {
+      log(`  Продолжаем с страницы выдачи: ${listingPageIdx}`);
+    }
+    crawlState.serpPageIndex = listingPageIdx;
 
     log('  короткая пауза перед сбором данных со страницы…');
     await randomDelay(2500, 5500);
@@ -774,12 +868,12 @@ async function runAttempt(params) {
     /** @type {Awaited<ReturnType<typeof parseListings>>} */
     let raw = [];
 
-    logStep(9, 'Парсинг страницы 1', 'первый проход');
+    logStep(9, `Парсинг страницы выдачи ${listingPageIdx}`, 'первый проход');
     let batch = await parseListings(page);
     raw.push(...batch);
     log(`  собрано записей: ${batch.length}`);
 
-    logStep(10, 'Скролл страницы 1', 'догрузка карточек и просмотр пагинации внизу');
+    logStep(10, `Скролл страницы выдачи ${listingPageIdx}`, 'догрузка карточек и просмотр пагинации внизу');
     await humanBehavior(page);
     await scrollForMoreListings(page);
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
@@ -800,15 +894,21 @@ async function runAttempt(params) {
     }
     log('  блокировка не обнаружена');
 
-    logStep(12, 'Парсинг страницы 1', 'второй проход после скролла (объединяем с первым)');
+    logStep(
+      12,
+      `Парсинг страницы выдачи ${listingPageIdx}`,
+      'второй проход после скролла (объединяем с первым)'
+    );
     batch = await parseListings(page);
     raw.push(...batch);
     raw = dedupeByHref(raw);
-    log(`  после объединения уникальных на странице 1: ${raw.length}`);
+    log(`  после объединения уникальных на странице ${listingPageIdx}: ${raw.length}`);
 
-    await saveListingsCheckpoint(raw, params, 'страница выдачи 1 (перед переходом на следующую)');
-
-    let listingPageIdx = 1;
+    await saveListingsCheckpoint(
+      raw,
+      params,
+      `страница выдачи ${listingPageIdx} (перед переходом на следующую)`
+    );
     while (listingPageIdx < MAX_SEARCH_PAGES) {
       if (totalPages != null && listingPageIdx >= totalPages) {
         log(`  достигнута страница ${totalPages} по пагинации — дальше не переходим`);
@@ -820,6 +920,7 @@ async function runAttempt(params) {
         break;
       }
       listingPageIdx += 1;
+      crawlState.serpPageIndex = listingPageIdx;
       log(
         `  открыта страница выдачи ${listingPageIdx}${totalPages != null ? ` из ${totalPages}` : ''}`
       );
@@ -828,7 +929,8 @@ async function runAttempt(params) {
         page,
         `страница выдачи ${listingPageIdx}`,
         ipHooks,
-        { isFirstPage: false }
+        { isFirstPage: false },
+        domGateFlow
       );
 
       await page.evaluate(() => window.scrollTo(0, 0));
@@ -874,7 +976,9 @@ async function runAttempt(params) {
       logStep(15, 'Пауза перед закрытием браузера', 'смотрите окно Chromium');
       await waitEnterBeforeCloseBrowser();
     } else {
-      log('  IP_BLOCK: закрываем браузер без ожидания Enter (дальше пауза на ротацию прокси)');
+      log(
+        '  Закрываем браузер без ожидания Enter (блок IP / сбой DOM / следующая попытка в main).'
+      );
     }
     log('  Закрытие Chromium…');
     await context.close().catch(() => {});
