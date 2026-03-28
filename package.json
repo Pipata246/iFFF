@@ -1,0 +1,17 @@
+{
+  "name": "avito-playwright-parser",
+  "version": "1.0.0",
+  "description": "Парсер Avito на Playwright с сохранением в Excel",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js",
+    "postinstall": "playwright install chromium"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0",
+    "xlsx": "^0.18.5"
+  }
+}
