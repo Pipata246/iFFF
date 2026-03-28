@@ -581,6 +581,7 @@ function buildSearchParamsExportRows(params) {
     sellerType: params.sellerType,
   });
   return [
+    { Параметр: 'Площадка', Значение: 'Avito' },
     { Параметр: 'URL поиска (как открывал парсер)', Значение: searchUrl },
     { Параметр: 'Поисковый запрос', Значение: params.query || '' },
     { Параметр: 'Доп. слова (фильтр по названию)', Значение: (params.extraKeywords || '').trim() || '—' },
@@ -624,30 +625,42 @@ const EXCEL_LIST_HEADERS = [
 
 /**
  * Сохранить xlsx: лист объявлений (поля с карточки) и при передаче searchParams — лист фильтров запуска.
- * @param {Array<{ title: string, priceText: string, priceNum?: number|null, href: string, city: string, memoryLabel?: string, sellerName?: string, sellerKind?: string, rating?: number|null, publishedLabel?: string }>} rows
- * @param {{ checkpoint?: string, searchParams?: SearchParams & { memory?: string, minRating?: number, onlyToday?: boolean } }} [meta]
+ * @param {Array<{ title: string, priceText: string, priceNum?: number|null, href: string, city: string, memoryLabel?: string, sellerName?: string, sellerKind?: string, rating?: number|null, publishedLabel?: string, marketplace?: string }>} rows
+ * @param {{ checkpoint?: string, searchParams?: SearchParams & { memory?: string, minRating?: number, onlyToday?: boolean }, filterExportRows?: Array<{ Параметр: string, Значение: string }> }} [meta]
  */
 function saveToExcel(rows, meta) {
   const m = meta && typeof meta === 'object' ? meta : {};
-  const sheetRows = rows.map((r) => ({
-    Название: r.title,
-    Цена: r.priceText || (r.priceNum != null ? String(r.priceNum) : ''),
-    Память: r.memoryLabel != null && String(r.memoryLabel).trim() !== '' ? r.memoryLabel : '—',
-    'Имя продавца': r.sellerName != null && String(r.sellerName).trim() !== '' ? r.sellerName : '—',
-    'Тип продавца': sellerKindToRu(r.sellerKind || 'unknown'),
-    Рейтинг: r.rating != null && Number.isFinite(r.rating) ? r.rating : '—',
-    Опубликовано:
-      r.publishedLabel != null && String(r.publishedLabel).trim() !== '' ? r.publishedLabel : '—',
-    Город: r.city,
-    Ссылка: r.href,
-  }));
+  const showMarketplace = rows.some((r) => r && typeof r.marketplace === 'string' && r.marketplace !== '');
+  const sheetRows = rows.map((r) => {
+    const row = {
+      Название: r.title,
+      Цена: r.priceText || (r.priceNum != null ? String(r.priceNum) : ''),
+      Память: r.memoryLabel != null && String(r.memoryLabel).trim() !== '' ? r.memoryLabel : '—',
+      'Имя продавца': r.sellerName != null && String(r.sellerName).trim() !== '' ? r.sellerName : '—',
+      'Тип продавца': sellerKindToRu(r.sellerKind || 'unknown'),
+      Рейтинг: r.rating != null && Number.isFinite(r.rating) ? r.rating : '—',
+      Опубликовано:
+        r.publishedLabel != null && String(r.publishedLabel).trim() !== '' ? r.publishedLabel : '—',
+      Город: r.city,
+      Ссылка: r.href,
+    };
+    if (showMarketplace) {
+      row['Площадка'] = r.marketplace && String(r.marketplace).trim() !== '' ? r.marketplace : '—';
+    }
+    return row;
+  });
   const ws = sheetRows.length
     ? XLSX.utils.json_to_sheet(sheetRows)
     : XLSX.utils.aoa_to_sheet([EXCEL_LIST_HEADERS]);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Объявления');
-  if (m.searchParams) {
-    const filterRows = buildSearchParamsExportRows(m.searchParams);
+  const filterRows =
+    Array.isArray(m.filterExportRows) && m.filterExportRows.length > 0
+      ? m.filterExportRows
+      : m.searchParams
+        ? buildSearchParamsExportRows(m.searchParams)
+        : null;
+  if (filterRows) {
     const wsFilters = XLSX.utils.json_to_sheet(filterRows);
     XLSX.utils.book_append_sheet(wb, wsFilters, 'Фильтры запуска');
   }
@@ -668,5 +681,6 @@ module.exports = {
   parseListings,
   filterListings,
   saveToExcel,
+  buildSearchParamsExportRows,
   isListingPublishedTodayByCardText,
 };

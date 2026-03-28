@@ -1,5 +1,5 @@
 /**
- * Точка входа: ввод параметров, переход на Avito, ожидание загрузки, парсинг, Excel.
+ * Точка входа: выбор площадки (Avito / Wildberries / обе подряд), ввод фильтров, Playwright, Excel.
  * Запуск: node main.js
  */
 
@@ -24,7 +24,10 @@ const {
   parseListings,
   filterListings,
   saveToExcel,
+  buildSearchParamsExportRows,
 } = require('./parser');
+const { buildWbSearchParamsExportRows } = require('./parser_wb');
+const { runAttemptWb } = require('./wb_runner');
 
 /**
  * Верхняя граница запусков runAttempt за один вызов main (капча/IP, сеть, Excel и т.д.).
@@ -36,6 +39,9 @@ const MAX_RUN_ATTEMPTS_MIN = 15;
 let resumeListingUrl = null;
 /** Номер страницы выдачи (1-based), соответствующий сохранённому URL. */
 let resumeSerpPageIndex = null;
+
+/** Лист «Фильтры запуска» в Excel: одна или две секции (Avito + WB). */
+let sessionFilterExportRows = null;
 
 /**
  * Номер страницы выдачи из query ?p= (у Avito вторая страница обычно p=2).
@@ -94,9 +100,17 @@ function isExcelFileBusyError(e) {
  */
 async function saveListingsCheckpoint(raw, params, checkpointLabel) {
   const filtered = filterListings(dedupeByHref(raw), listingsFilterOpts(params));
+  const rowsForExcel =
+    params.marketplace === 'both'
+      ? filtered.map((r) => ({ ...r, marketplace: 'Avito' }))
+      : filtered;
+  const excelMeta =
+    sessionFilterExportRows && sessionFilterExportRows.length > 0
+      ? { checkpoint: checkpointLabel, filterExportRows: sessionFilterExportRows }
+      : { checkpoint: checkpointLabel, searchParams: params };
   for (let i = 0; i < EXCEL_CHECKPOINT_RETRIES; i++) {
     try {
-      saveToExcel(filtered, { checkpoint: checkpointLabel, searchParams: params });
+      saveToExcel(rowsForExcel, excelMeta);
       return;
     } catch (e) {
       if (!isExcelFileBusyError(e) || i === EXCEL_CHECKPOINT_RETRIES - 1) {
@@ -598,35 +612,76 @@ function ask(rl, q) {
 }
 
 /**
- * @returns {Promise<import('./parser').SearchParams & { memory: string, minRating: number, onlyToday: boolean }>}
+ * @returns {Promise<import('./parser').SearchParams & { memory: string, minRating: number, onlyToday: boolean, marketplace: 'avito'|'wb'|'both', color: string, wbRatingMode: 'any'|'with'|'without' }>}
  */
 async function collectParams() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
   try {
+    const platRaw = await ask(
+      rl,
+      'Площадка: 1 — только Avito, 2 — только Wildberries, 3 — Avito и WB подряд (сначала Avito): '
+    );
+    const p0 = platRaw.trim().toLowerCase();
+    let marketplace = 'avito';
+    if (p0 === '2' || p0 === 'wb' || p0 === 'вб') marketplace = 'wb';
+    else if (
+      p0 === '3' ||
+      p0 === 'both' ||
+      /оба|обе|все|avito.*wb|wb.*avito|вместе/i.test(platRaw)
+    ) {
+      marketplace = 'both';
+    }
+
     const query = await ask(rl, 'Поисковый запрос (например iPhone): ');
     const extraKeywords = await ask(rl, 'Доп. ключевые слова через пробел (например 17 Pro Max), можно пусто: ');
-    const city = await ask(rl, 'Город (например Москва или moskva): ');
-    const minPriceStr = await ask(rl, 'Минимальная цена (число, 0 = не важно): ');
-    const maxPriceStr = await ask(rl, 'Максимальная цена (число, 0 = не важно): ');
+
+    let city = '';
+    if (marketplace === 'avito' || marketplace === 'both') {
+      city = await ask(rl, 'Город Avito (например Москва или moskva): ');
+    }
+
+    const minPriceStr = await ask(rl, 'Цена от, руб. (0 = не важно; для WB также в ссылке priceU): ');
+    const maxPriceStr = await ask(rl, 'Цена до, руб. (0 = не важно): ');
     const memory = await ask(rl, 'Память, ГБ (например 256), пусто = любая: ');
-    const sellerRaw = await ask(rl, 'Тип продавца: private | company | any: ');
-    const minRatingStr = await ask(rl, 'Мин. рейтинг продавца (0-5, 0 = не важно): ');
-    const onlyTodayRaw = await ask(
-      rl,
-      'Только объявления «за сегодня» по подписи на карточке (N часов/минут назад, «сегодня», «только что»)? да / нет: '
-    );
+
+    let sellerType = 'any';
+    let minRating = 0;
+    let onlyToday = false;
+    if (marketplace === 'avito' || marketplace === 'both') {
+      const sellerRaw = await ask(rl, 'Avito — тип продавца: private | company | any: ');
+      sellerType = (sellerRaw || 'any').toLowerCase();
+      if (!['private', 'company', 'any'].includes(sellerType)) sellerType = 'any';
+      const minRatingStr = await ask(rl, 'Avito — мин. рейтинг продавца (0-5, 0 = не важно): ');
+      minRating = parseFloat(minRatingStr.replace(',', '.')) || 0;
+      const onlyTodayRaw = await ask(
+        rl,
+        'Avito — только «за сегодня» по подписи на карточке? да / нет: '
+      );
+      const ot = (onlyTodayRaw || '').trim().toLowerCase();
+      onlyToday =
+        ot === 'да' || ot === 'д' || ot === '+' || ot === 'yes' || ot === 'y' || ot === '1' || ot === 'true';
+    }
+
+    let color = '';
+    /** @type {'any'|'with'|'without'} */
+    let wbRatingMode = 'any';
+    if (marketplace === 'wb' || marketplace === 'both') {
+      color = await ask(rl, 'Wildberries — цвет в названии (подстрока, пусто = любой): ');
+      const wr = await ask(
+        rl,
+        'Wildberries — оценки на карточке: 1 — не важно, 2 — только с рейтингом, 3 — только без рейтинга: '
+      );
+      const w = (wr || '').trim().toLowerCase();
+      if (w === '2' || /только\s*с|с\s*рейтинг|есть\s*оцен/i.test(w)) wbRatingMode = 'with';
+      else if (w === '3' || /без\s*рейтинг|нет\s*рейтинг|без\s*оцен/i.test(w)) wbRatingMode = 'without';
+    }
 
     const minPrice = parseInt(minPriceStr, 10) || 0;
     const maxPrice = parseInt(maxPriceStr, 10) || 0;
-    let sellerType = (sellerRaw || 'any').toLowerCase();
-    if (!['private', 'company', 'any'].includes(sellerType)) sellerType = 'any';
-    const minRating = parseFloat(minRatingStr.replace(',', '.')) || 0;
-    const ot = (onlyTodayRaw || '').trim().toLowerCase();
-    const onlyToday =
-      ot === 'да' || ot === 'д' || ot === '+' || ot === 'yes' || ot === 'y' || ot === '1' || ot === 'true';
 
     return {
+      marketplace,
       query,
       extraKeywords,
       city,
@@ -636,10 +691,26 @@ async function collectParams() {
       sellerType,
       minRating,
       onlyToday,
+      color,
+      wbRatingMode,
     };
   } finally {
     rl.close();
   }
+}
+
+/**
+ * Строки для листа фильтров: одна площадка или Avito+WB.
+ * @param {{ marketplace: string }} params
+ */
+function buildSessionFilterExportRows(params) {
+  if (params.marketplace === 'avito') return buildSearchParamsExportRows(params);
+  if (params.marketplace === 'wb') return buildWbSearchParamsExportRows(params);
+  return [
+    ...buildSearchParamsExportRows(params),
+    { Параметр: '—', Значение: '—' },
+    ...buildWbSearchParamsExportRows(params),
+  ];
 }
 
 /**
@@ -986,9 +1057,64 @@ async function runAttempt(params) {
   }
 }
 
+/**
+ * Повторы при IP_BLOCK и прочих сбоях (отдельный счётчик для каждого вызова).
+ * @template T
+ * @param {string} label
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+async function runIpRetryLoop(label, fn) {
+  let lastErr = null;
+  let ipRotationWaitsDone = 0;
+  const ipWaitLimitRaw = maxIpRotationWaits();
+  const ipWaitLimit = effectiveIpRotationWaitLimit();
+  const maxRunAttempts = Math.max(MAX_RUN_ATTEMPTS_MIN, ipWaitLimit + 10);
+
+  for (let attempt = 1; attempt <= maxRunAttempts; attempt++) {
+    try {
+      if (attempt > 1) {
+        logRetry(`${label}: попытка ${attempt} из ${maxRunAttempts}`);
+      }
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const msg = e && e.message ? e.message : String(e);
+
+      if (msg === 'IP_BLOCK') {
+        if (ipRotationWaitsDone >= ipWaitLimit) {
+          logBlock(
+            ipWaitLimitRaw === 0 &&
+              (process.env.AVITO_IP_BLOCK_NO_WAIT === '1' || process.env.AVITO_IP_BLOCK_NO_WAIT === 'true')
+              ? `${label}: ограничение по IP — пауза ротации отключена (AVITO_IP_BLOCK_NO_WAIT).`
+              : `${label}: ограничение по IP — исчерпаны паузы ротации (${ipRotationWaitsDone}/${ipWaitLimit}).`
+          );
+          break;
+        }
+        ipRotationWaitsDone += 1;
+        const waitMs = randomInt(IP_ROTATION_WAIT_MIN_MS, IP_ROTATION_WAIT_MAX_MS);
+        logBlock(
+          `${label}: ограничение по IP / капча — пауза ~${Math.round(waitMs / 1000)} с (${ipRotationWaitsDone}/${ipWaitLimit}), затем повтор…`
+        );
+        await randomDelay(waitMs, waitMs);
+        continue;
+      }
+
+      logRetry(`${label}: ${msg} (пауза перед следующей попыткой)`);
+      await randomDelay(3000, 6000);
+    }
+  }
+
+  console.error(
+    `${label}: не удалось завершить за ${maxRunAttempts} попыток. Последняя ошибка:`,
+    lastErr
+  );
+  process.exit(1);
+}
+
 async function main() {
-  log('СТАРТ — парсер Avito (Playwright, сохранение в Excel)');
-  log('  Браузер закроется только после Enter в консоли (или задайте AVITO_AUTO_CLOSE=1 для старого поведения).');
+  log('СТАРТ — парсер Avito / Wildberries (Playwright, Excel)');
+  log('  Браузер закроется после Enter в консоли (или AVITO_AUTO_CLOSE=1).');
   logProxyAndRotationSettings();
 
   let params;
@@ -1007,56 +1133,29 @@ async function main() {
   }
 
   initSessionResultsOutput();
+  sessionFilterExportRows = buildSessionFilterExportRows(params);
   log(
     `  Файл результатов (новый на этот запуск; время в имени — пояс Самары/Саратова, UTC+4): ${resultsPath()}`
   );
 
-  let lastErr = null;
-  let ipRotationWaitsDone = 0;
-  const ipWaitLimitRaw = maxIpRotationWaits();
-  const ipWaitLimit = effectiveIpRotationWaitLimit();
-  const maxRunAttempts = Math.max(MAX_RUN_ATTEMPTS_MIN, ipWaitLimit + 10);
+  /** @type {Array<object>} */
+  let priorForWb = [];
 
-  for (let attempt = 1; attempt <= maxRunAttempts; attempt++) {
-    try {
-      if (attempt > 1) {
-        logRetry(`попытка ${attempt} из ${maxRunAttempts}`);
-      }
-      await runAttempt(params);
-      return;
-    } catch (e) {
-      lastErr = e;
-      const msg = e && e.message ? e.message : String(e);
-
-      if (msg === 'IP_BLOCK') {
-        if (ipRotationWaitsDone >= ipWaitLimit) {
-          logBlock(
-            ipWaitLimitRaw === 0 &&
-              (process.env.AVITO_IP_BLOCK_NO_WAIT === '1' || process.env.AVITO_IP_BLOCK_NO_WAIT === 'true')
-              ? 'ограничение по IP — пауза ротации отключена (AVITO_IP_BLOCK_NO_WAIT).'
-              : `ограничение по IP — исчерпаны паузы ротации (${ipRotationWaitsDone}/${ipWaitLimit}).`
-          );
-          break;
-        }
-        ipRotationWaitsDone += 1;
-        const waitMs = randomInt(IP_ROTATION_WAIT_MIN_MS, IP_ROTATION_WAIT_MAX_MS);
-        logBlock(
-          `ограничение по IP / капча — пауза ~${Math.round(waitMs / 1000)} с под новый IP прокси (${ipRotationWaitsDone}/${ipWaitLimit}), затем повтор…`
-        );
-        await randomDelay(waitMs, waitMs);
-        continue;
-      }
-
-      logRetry(`${msg} (пауза перед следующей попыткой)`);
-      await randomDelay(3000, 6000);
+  if (params.marketplace === 'avito' || params.marketplace === 'both') {
+    const avitoRows = await runIpRetryLoop('Avito', () => runAttempt(params));
+    if (params.marketplace === 'both') {
+      priorForWb = avitoRows.map((r) => ({ ...r, marketplace: 'Avito' }));
     }
   }
 
-  console.error(
-    `Не удалось завершить работу за ${maxRunAttempts} попыток. Последняя ошибка:`,
-    lastErr
-  );
-  process.exit(1);
+  if (params.marketplace === 'wb' || params.marketplace === 'both') {
+    await runIpRetryLoop('Wildberries', () =>
+      runAttemptWb(params, {
+        priorExcelRows: priorForWb,
+        filterExportRows: sessionFilterExportRows,
+      })
+    );
+  }
 }
 
 main();
