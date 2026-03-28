@@ -93,6 +93,23 @@ function parseWbSerpPageIndexFromUrl(urlStr) {
 }
 
 /**
+ * Выдача WB на поиске — бесконечная лента без «страниц»; в URL всегда держим page=1,
+ * чтобы не уходить на ложную пагинацию после смены IP / возобновления.
+ * @param {string} urlStr
+ * @returns {string}
+ */
+function normalizeWbSearchUrlSingleFeed(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if (!u.hostname.toLowerCase().includes('wildberries')) return urlStr;
+    u.searchParams.set('page', '1');
+    return u.href;
+  } catch (_) {
+    return urlStr;
+  }
+}
+
+/**
  * @param {import('playwright').Page} page
  */
 async function hasWbEmptySerpMessage(page) {
@@ -426,6 +443,7 @@ module.exports = {
   parseWbMemoryGb,
   WB_MEMORY_FACET_PARAM,
   WB_MEMORY_GB_TO_F4424,
+  normalizeWbSearchUrlSingleFeed,
   parseWbSerpPageIndexFromUrl,
   hasWbEmptySerpMessage,
   looksLikeWbSkeletonNoItems,

@@ -17,7 +17,7 @@ const {
 const { detectBlock, saveToExcel } = require('./parser');
 const {
   buildWbSearchUrl,
-  parseWbSerpPageIndexFromUrl,
+  normalizeWbSearchUrlSingleFeed,
   hasWbEmptySerpMessage,
   looksLikeWbSkeletonNoItems,
   parseWbListings,
@@ -48,8 +48,8 @@ function rememberWbListingForIpRetry(ctx) {
   if (!/wildberries\.ru/i.test(url)) {
     url = openUrl;
   }
-  resumeListingUrlWb = url;
-  resumeSerpPageIndexWb = crawlState.serpPageIndex;
+  resumeListingUrlWb = normalizeWbSearchUrlSingleFeed(url);
+  resumeSerpPageIndexWb = 1;
   log(
     `  WB: капча / IP-блок — сохранена позиция выдачи (стр. ${resumeSerpPageIndexWb}); закроем браузер и повторим после ротации мобильного прокси.`
   );
@@ -57,13 +57,14 @@ function rememberWbListingForIpRetry(ctx) {
 }
 
 const NAV_TIMEOUT_MS = 180_000;
-const SELECTOR_TIMEOUT_MS = 120_000;
 const PAGE_LOAD_TIMEOUT_MS = 90_000;
 const MAX_DOM_RELOAD_ATTEMPTS = 3;
 const CARD_WAIT_BEFORE_FIRST_RELOAD_MS = 50_000;
 const CARD_WAIT_AFTER_DOM_RELOAD_MS = 95_000;
-const MAX_SEARCH_PAGES_WB = 80;
-const LIST_PAGE_SCROLL_MAX = 5;
+/** Скролл ленты WB: столько циклов «вниз + пауза» (подгрузка без пагинации). */
+const WB_FEED_SCROLL_MAX = 120;
+/** Подряд одинаковый счётчик карточек — считаем, лента закончилась. */
+const WB_FEED_STABLE_ROUNDS = 4;
 
 /** Карточки товара на выдаче WB (несколько вариантов вёрстки). */
 const WB_ITEM_SELECTOR =
@@ -340,118 +341,56 @@ async function humanBehavior(page) {
   await randomDelay(SOFT.afterBottomMin, SOFT.afterBottomMax);
 }
 
-async function scrollForMoreWbListings(page) {
+/**
+ * Wildberries: одна «страница» поиска = бесконечная лента; крутим вниз, пока число карточек перестанет расти.
+ * @param {import('playwright').Page} page
+ * @param {{ maxIter?: number, stableRounds?: number }} [opts]
+ */
+async function scrollWbFeedUntilStable(page, opts = {}) {
+  const maxIter = Number.isFinite(opts.maxIter) && opts.maxIter > 0 ? Math.floor(opts.maxIter) : WB_FEED_SCROLL_MAX;
+  const stableNeed =
+    Number.isFinite(opts.stableRounds) && opts.stableRounds > 0
+      ? Math.floor(opts.stableRounds)
+      : WB_FEED_STABLE_ROUNDS;
   let last = await page.locator(WB_ITEM_SELECTOR).count().catch(() => 0);
-  let stableRounds = 0;
-  for (let i = 0; i < LIST_PAGE_SCROLL_MAX; i++) {
+  let stable = 0;
+  log(
+    `  WB: догрузка ленты скроллом (без вкладок/страниц), до ${maxIter} циклов, стабильность ×${stableNeed}…`
+  );
+  for (let i = 0; i < maxIter; i++) {
+    await page.evaluate(() => {
+      const h = document.body?.scrollHeight ?? 0;
+      const y = window.scrollY;
+      const step = Math.min(950, Math.max(350, (h - y) / 2.5));
+      window.scrollBy(0, step);
+    });
+    await page.mouse.wheel(0, randomInt(SOFT.listWheelMin, SOFT.listWheelMax + 150));
+    await randomDelay(SOFT.listPauseMin + 500, SOFT.listPauseMax + 2000);
+    if (i % 6 === 5) {
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await randomDelay(2200, 4500);
+    }
     const n = await page.locator(WB_ITEM_SELECTOR).count().catch(() => 0);
-    log(`  WB скролл ${i + 1}/${LIST_PAGE_SCROLL_MAX}: карточек — ${n}`);
+    if (i % 12 === 11 || i === 0) {
+      log(`  WB лента: цикл ${i + 1}/${maxIter}, карточек в DOM — ${n}`);
+    }
     if (n === last) {
-      stableRounds += 1;
-      if (stableRounds >= 2) break;
+      stable += 1;
+      if (stable >= stableNeed) {
+        log(
+          `  WB: карточек ${n} — не менялось ${stableNeed} раз подряд, лента исчерпана или лимит подгрузки`
+        );
+        break;
+      }
     } else {
-      stableRounds = 0;
+      stable = 0;
       last = n;
     }
-    await page.mouse.wheel(0, randomInt(SOFT.listWheelMin, SOFT.listWheelMax));
-    await randomDelay(SOFT.listPauseMin, SOFT.listPauseMax);
   }
-}
-
-/**
- * @param {import('playwright').Page} page
- * @returns {Promise<boolean>}
- */
-async function clickNextWbPage(page) {
-  const beforeUrl = page.url();
-  let firstHref = '';
-  try {
-    firstHref =
-      (await page.locator(`${WB_ITEM_SELECTOR} a[href*="detail"]`).first().getAttribute('href')) || '';
-  } catch {
-    firstHref = '';
-  }
-
-  const nextLocators = [
-    page.locator('a.pagination__next:not([aria-disabled="true"])').first(),
-    page.locator('a[rel="next"]').first(),
-    page.getByRole('link', { name: /Следующая|Далее/i }).first(),
-  ];
-
-  let clicked = false;
-  for (const loc of nextLocators) {
-    if (!(await loc.isVisible().catch(() => false))) continue;
-    try {
-      await loc.click({ timeout: 10_000 });
-      clicked = true;
-      break;
-    } catch {
-      /* next */
-    }
-  }
-
-  if (!clicked) {
-    try {
-      const u = new URL(page.url());
-      if (!u.hostname.includes('wildberries')) return false;
-      const cur = parseInt(u.searchParams.get('page') || '1', 10) || 1;
-      u.searchParams.set('page', String(cur + 1));
-      await page.goto(u.href, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
-      await randomDelay(2000, 4500);
-      if (page.url() === beforeUrl) return false;
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  try {
-    await page.waitForFunction(
-      ({ prevUrl, prevHref }) => {
-        if (window.location.href !== prevUrl) return true;
-        const a = document.querySelector(`${WB_ITEM_SELECTOR.split(',')[0].trim()} a[href*="detail"]`);
-        const h = a ? a.getAttribute('href') || '' : '';
-        return prevHref ? h !== prevHref : h.length > 0;
-      },
-      { prevUrl: beforeUrl, prevHref: firstHref },
-      { timeout: 25_000 }
-    );
-  } catch {
-    await randomDelay(3500, 7000);
-  }
-  await randomDelay(1500, 3500);
-  return true;
-}
-
-/**
- * @param {import('playwright').Page} page
- * @returns {Promise<number|null>}
- */
-async function detectPaginationTotalPagesWb(page) {
-  const n = await page.evaluate(() => {
-    let max = 0;
-    document.querySelectorAll('a[href*="page="]').forEach((a) => {
-      try {
-        const u = new URL(/** @type {HTMLAnchorElement} */ (a).href, location.origin);
-        const p = u.searchParams.get('page');
-        if (p) {
-          const v = parseInt(p, 10);
-          if (Number.isFinite(v) && v > 0 && v < 500) max = Math.max(max, v);
-        }
-      } catch {
-        /* ignore */
-      }
-    });
-    document.querySelectorAll('[class*="pagination"] a, nav a').forEach((a) => {
-      const t = (a.textContent || '').trim().replace(/\s+/g, '');
-      if (/^\d{1,3}$/.test(t)) {
-        const v = parseInt(t, 10);
-        if (v > 0 && v < 500) max = Math.max(max, v);
-      }
-    });
-    return max > 0 ? max : 0;
-  });
-  return n > 0 ? n : null;
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await randomDelay(4000, 7500);
+  const finalN = await page.locator(WB_ITEM_SELECTOR).count().catch(() => 0);
+  log(`  WB: после прокрутки ленты карточек в DOM — ${finalN}`);
 }
 
 const EXCEL_CHECKPOINT_RETRIES = 10;
@@ -517,21 +456,15 @@ async function runAttemptWb(params, opts = {}) {
   });
 
   const openingFromResume = resumeListingUrlWb != null;
-  const openUrl = openingFromResume ? resumeListingUrlWb : builtUrl;
-  /** @type {number|null} */
-  let savedResumePageIdx = null;
+  const resumedUrl = openingFromResume ? resumeListingUrlWb : null;
   if (openingFromResume) {
-    savedResumePageIdx = resumeSerpPageIndexWb;
     resumeListingUrlWb = null;
     resumeSerpPageIndexWb = null;
-    log(
-      `  WB возобновление: открываем сохранённый URL${savedResumePageIdx != null ? ` (стр. ${savedResumePageIdx})` : ''}.`
-    );
+    log('  WB возобновление: сохранённый адрес выдачи (одна лента, без «страниц»).');
   }
+  const openUrl = normalizeWbSearchUrlSingleFeed(resumedUrl || builtUrl);
 
-  const crawlState = {
-    serpPageIndex: savedResumePageIdx != null ? savedResumePageIdx : 1,
-  };
+  const crawlState = { serpPageIndex: 1 };
 
   logStep(1, 'Запуск браузера (Wildberries)', isProxyDisabled() ? 'без прокси' : 'с прокси');
   if (isProxyDisabled()) {
@@ -568,9 +501,9 @@ async function runAttemptWb(params, opts = {}) {
       try {
         const p = domGateCtx.page;
         if (p) {
-          resumeListingUrlWb = p.url();
-          resumeSerpPageIndexWb = crawlState.serpPageIndex;
-          log(`  WB запомнили: стр. ${resumeSerpPageIndexWb} — ${resumeListingUrlWb}`);
+          resumeListingUrlWb = normalizeWbSearchUrlSingleFeed(p.url());
+          resumeSerpPageIndexWb = 1;
+          log(`  WB запомнили адрес ленты: ${resumeListingUrlWb}`);
         }
       } catch (_) {
         /* ignore */
@@ -580,7 +513,7 @@ async function runAttemptWb(params, opts = {}) {
   };
 
   try {
-    log('  сценарий WB: переход → гейт → парсинг → скролл → страницы выдачи');
+    log('  сценарий WB: переход → гейт → парсинг → длинный скролл ленты (без пагинации)');
     await randomDelay(SOFT.beforeGotoMin, SOFT.beforeGotoMax);
     logStep(4, 'Адрес поиска Wildberries', openUrl);
 
@@ -639,92 +572,42 @@ async function runAttemptWb(params, opts = {}) {
       domGateFlow
     );
 
-    let listingPageIdx =
-      savedResumePageIdx != null
-        ? savedResumePageIdx
-        : openingFromResume
-          ? parseWbSerpPageIndexFromUrl(page.url())
-          : 1;
-    if (!openingFromResume) {
-      listingPageIdx = 1;
-    } else {
-      log(`  WB: продолжаем со страницы выдачи ${listingPageIdx}`);
-    }
-    crawlState.serpPageIndex = listingPageIdx;
+    crawlState.serpPageIndex = 1;
 
     log('  пауза перед сбором данных с выдачи WB (осторожный осмотр страницы, как на Avito)…');
     await randomDelay(SOFT.afterListingGateMin, SOFT.afterListingGateMax);
     let raw = [];
     let batch = await parseWbListings(page);
     raw.push(...batch);
-    log(`  WB собрано записей (первый проход): ${batch.length}`);
+    log(`  WB собрано записей (первый проход, верх ленты): ${batch.length}`);
 
-    logStep(10, 'Скролл выдачи Wildberries', 'имитация чтения и догрузка карточек');
+    logStep(10, 'Скролл ленты Wildberries', 'имитация чтения и подгрузка карточек до упора');
     await humanBehavior(page);
-    await scrollForMoreWbListings(page);
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await randomDelay(2500, 5000);
-
-    const totalPages = await detectPaginationTotalPagesWb(page);
-    if (totalPages != null) log(`  WB пагинация: до ${totalPages} стр. (оценка по ссылкам)`);
+    await scrollWbFeedUntilStable(page);
 
     batch = await parseWbListings(page);
     raw.push(...batch);
     raw = dedupeByHref(raw);
-    log(`  WB после скролла и второго прохода, уникальных: ${raw.length}`);
+    log(`  WB после полного скролла ленты, уникальных: ${raw.length}`);
+
+    log('  финальный проход: снова вверх и укороченный скролл ленты для догрузки…');
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await randomDelay(2000, 4000);
+    await gentleWarmupScroll(page);
+    await humanBehavior(page);
+    await scrollWbFeedUntilStable(page, { maxIter: 70, stableRounds: 3 });
+    batch = await parseWbListings(page);
+    raw.push(...batch);
+    raw = dedupeByHref(raw);
+    log(`  WB после финального прохода, уникальных: ${raw.length}`);
 
     await saveWbCheckpoint(
       raw,
       params,
-      `WB страница ${listingPageIdx} (перед следующей)`,
+      'WB вся лента выдачи (одна страница поиска)',
       priorExcelRows,
       filterExportRows
     );
-
-    while (listingPageIdx < MAX_SEARCH_PAGES_WB) {
-      if (totalPages != null && listingPageIdx >= totalPages) {
-        log(`  WB: достигнута стр. ${totalPages}`);
-        break;
-      }
-      const moved = await clickNextWbPage(page);
-      if (!moved) {
-        log(`  WB: следующей страницы нет, обработано ${listingPageIdx}`);
-        break;
-      }
-      listingPageIdx += 1;
-      crawlState.serpPageIndex = listingPageIdx;
-      log(`  WB открыта страница ${listingPageIdx}`);
-
-      await gateWbListingPageReady(
-        page,
-        `WB страница ${listingPageIdx}`,
-        ipHooks,
-        { isFirstPage: false },
-        domGateFlow
-      );
-
-      await page.evaluate(() => window.scrollTo(0, 0));
-      await randomDelay(2500, 5500);
-      await gentleWarmupScroll(page);
-      log(`  WB стр. ${listingPageIdx}: имитация чтения перед скроллом…`);
-      await humanBehavior(page);
-      await scrollForMoreWbListings(page);
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await randomDelay(2500, 5000);
-
-      batch = await parseWbListings(page);
-      raw.push(...batch);
-      raw = dedupeByHref(raw);
-      log(`  WB стр. ${listingPageIdx}: +${batch.length}, всего уникальных: ${raw.length}`);
-
-      await saveWbCheckpoint(
-        raw,
-        params,
-        `WB страница ${listingPageIdx} (перед следующей)`,
-        priorExcelRows,
-        filterExportRows
-      );
-    }
 
     raw = dedupeByHref(raw);
     const filtered = filterWbListings(raw, wbListingsFilterOpts(params));
