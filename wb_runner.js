@@ -58,6 +58,7 @@ function rememberWbListingForIpRetry(ctx) {
 
 const NAV_TIMEOUT_MS = 180_000;
 const PAGE_LOAD_TIMEOUT_MS = 90_000;
+/** Перезагрузки вкладки при «голом» DOM (как main.js у Avito): domTry 1..MAX = ровно MAX перезагрузок после первой загрузки. */
 const MAX_DOM_RELOAD_ATTEMPTS = 3;
 const CARD_WAIT_BEFORE_FIRST_RELOAD_MS = 50_000;
 const CARD_WAIT_AFTER_DOM_RELOAD_MS = 95_000;
@@ -250,7 +251,10 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
       } catch (reloadErr) {
         const m = reloadErr && reloadErr.message ? reloadErr.message : String(reloadErr);
         if (m === 'IP_BLOCK') throw reloadErr;
-        if (isLikelyProxyOrTunnelDrop(reloadErr)) hooks.onIpBlock();
+        if (isLikelyProxyOrTunnelDrop(reloadErr)) {
+          logNetFailureHelp(reloadErr);
+          hooks.onIpBlock();
+        }
         throw reloadErr;
       }
       await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
@@ -508,7 +512,9 @@ async function runAttemptWb(params, opts = {}) {
       } catch (_) {
         /* ignore */
       }
-      log('  WB: выдача не поднялась — закрываем браузер без Enter, будет повтор.');
+      log(
+        '  WB: до 3 перезагрузок вкладки в этом браузере исчерпаны (или таймаут карточек) — закрываем Chromium без Enter; следующая попытка откроет сохранённый URL. Пауза перед повтором короче, чем при капче (~2 мин).'
+      );
     },
   };
 

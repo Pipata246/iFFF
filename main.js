@@ -162,6 +162,12 @@ async function saveListingsCheckpoint(raw, params, checkpointLabel) {
 const DEFAULT_IP_ROTATION_WAITS = 5;
 
 /**
+ * Верхняя граница пауз ~2 мин при капче/IP на Wildberries за один запуск main.
+ * Avito использует только AVITO_IP_ROTATION_TRIES; на WB лимит не больше этого числа (и не больше eff. Avito).
+ */
+const WB_IP_ROTATION_MAX_WAITS = 5;
+
+/**
  * Сколько раз после IP_BLOCK ждать ротацию прокси (120–130 с) и снова запускать браузер.
  * По умолчанию 5 — чтобы пережить несколько блокировок подряд на мобильном прокси.
  * 0 в переменной — для IP_BLOCK минимум 1 пауза, если не задано AVITO_IP_BLOCK_NO_WAIT=1.
@@ -181,6 +187,11 @@ function effectiveIpRotationWaitLimit() {
   const skip = process.env.AVITO_IP_BLOCK_NO_WAIT === '1' || process.env.AVITO_IP_BLOCK_NO_WAIT === 'true';
   if (skip) return raw;
   return Math.max(1, raw);
+}
+
+/** Лимит пауз ротации для цикла Wildberries: не выше WB_IP_ROTATION_MAX_WAITS и не выше настроек Avito. */
+function effectiveWbIpRotationWaitLimit() {
+  return Math.min(WB_IP_ROTATION_MAX_WAITS, effectiveIpRotationWaitLimit());
 }
 
 /** Стартовая диагностика: прокси и лимит пауз ротации (чтобы не гадать, почему нет 2 мин ожидания). */
@@ -210,8 +221,15 @@ function logProxyAndRotationSettings() {
   if (effRaw === 0 && !skip) {
     log('  При 0 в TRIES после блокировки всё равно одна пауза ~2 мин под новый IP; полностью без ожидания: AVITO_IP_BLOCK_NO_WAIT=1');
   }
+  const wbIpWaits = effectiveWbIpRotationWaitLimit();
+  log(
+    `  Wildberries: при капче/IP те же паузы ~120–130 с; пауз ротации не больше ${WB_IP_ROTATION_MAX_WAITS} (сейчас ${wbIpWaits}, если AVITO_IP_ROTATION_TRIES меньше — берётся меньшее).`
+  );
   log(
     `  За один запуск main: до ${Math.max(MAX_RUN_ATTEMPTS_MIN, effectiveIpRotationWaitLimit() + 10)} попыток открыть Avito (с учётом капчи и прочих сбоев).`
+  );
+  log(
+    `  За один запуск main: до ${Math.max(MAX_RUN_ATTEMPTS_MIN, wbIpWaits + 10)} попыток открыть Wildberries (с учётом капчи, DOM и прочих сбоев).`
   );
 }
 
@@ -1076,13 +1094,19 @@ async function runAttempt(params) {
  * @template T
  * @param {string} label
  * @param {() => Promise<T>} fn
+ * @param {{ ipWaitLimit?: number }} [options] — лимит пауз ~2 мин при IP_BLOCK (по умолчанию effectiveIpRotationWaitLimit())
  * @returns {Promise<T>}
  */
-async function runIpRetryLoop(label, fn) {
+async function runIpRetryLoop(label, fn, options = {}) {
   let lastErr = null;
   let ipRotationWaitsDone = 0;
   const ipWaitLimitRaw = maxIpRotationWaits();
-  const ipWaitLimit = effectiveIpRotationWaitLimit();
+  const skipNoWait =
+    process.env.AVITO_IP_BLOCK_NO_WAIT === '1' || process.env.AVITO_IP_BLOCK_NO_WAIT === 'true';
+  const ipWaitLimit =
+    options != null && options.ipWaitLimit != null && Number.isFinite(options.ipWaitLimit)
+      ? Math.max(0, Math.floor(options.ipWaitLimit))
+      : effectiveIpRotationWaitLimit();
   const maxRunAttempts = Math.max(MAX_RUN_ATTEMPTS_MIN, ipWaitLimit + 10);
 
   for (let attempt = 1; attempt <= maxRunAttempts; attempt++) {
@@ -1098,8 +1122,7 @@ async function runIpRetryLoop(label, fn) {
       if (msg === 'IP_BLOCK') {
         if (ipRotationWaitsDone >= ipWaitLimit) {
           logBlock(
-            ipWaitLimitRaw === 0 &&
-              (process.env.AVITO_IP_BLOCK_NO_WAIT === '1' || process.env.AVITO_IP_BLOCK_NO_WAIT === 'true')
+            ipWaitLimitRaw === 0 && skipNoWait
               ? `${label}: ограничение по IP — пауза ротации отключена (AVITO_IP_BLOCK_NO_WAIT).`
               : `${label}: ограничение по IP — исчерпаны паузы ротации (${ipRotationWaitsDone}/${ipWaitLimit}).`
           );
@@ -1163,11 +1186,14 @@ async function main() {
   }
 
   if (params.marketplace === 'wb' || params.marketplace === 'both') {
-    await runIpRetryLoop('Wildberries', () =>
-      runAttemptWb(params, {
-        priorExcelRows: priorForWb,
-        filterExportRows: sessionFilterExportRows,
-      })
+    await runIpRetryLoop(
+      'Wildberries',
+      () =>
+        runAttemptWb(params, {
+          priorExcelRows: priorForWb,
+          filterExportRows: sessionFilterExportRows,
+        }),
+      { ipWaitLimit: effectiveWbIpRotationWaitLimit() }
     );
   }
 }
