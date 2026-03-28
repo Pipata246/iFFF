@@ -163,7 +163,7 @@ const DEFAULT_IP_ROTATION_WAITS = 5;
 
 /**
  * Верхняя граница пауз ~2 мин при капче/IP на Wildberries за один запуск main.
- * Avito использует только AVITO_IP_ROTATION_TRIES; на WB лимит не больше этого числа (и не больше eff. Avito).
+ * Ниже по умолчанию не урезаем из‑за малого AVITO_IP_ROTATION_TRIES (на Avito может быть 1, на WB — до 5).
  */
 const WB_IP_ROTATION_MAX_WAITS = 5;
 
@@ -189,9 +189,18 @@ function effectiveIpRotationWaitLimit() {
   return Math.max(1, raw);
 }
 
-/** Лимит пауз ротации для цикла Wildberries: не выше WB_IP_ROTATION_MAX_WAITS и не выше настроек Avito. */
+/**
+ * Лимит пауз ~2 мин при IP_BLOCK на Wildberries.
+ * Не опускаем ниже DEFAULT_IP_ROTATION_WAITS (5), если только не задано AVITO_IP_BLOCK_NO_WAIT с TRIES=0 —
+ * иначе низкий AVITO_IP_ROTATION_TRIES давал бы в логе (1/1) вместо пяти попыток на WB.
+ */
 function effectiveWbIpRotationWaitLimit() {
-  return Math.min(WB_IP_ROTATION_MAX_WAITS, effectiveIpRotationWaitLimit());
+  const skip = process.env.AVITO_IP_BLOCK_NO_WAIT === '1' || process.env.AVITO_IP_BLOCK_NO_WAIT === 'true';
+  const raw = maxIpRotationWaits();
+  if (skip && raw === 0) return 0;
+  if (skip) return Math.min(WB_IP_ROTATION_MAX_WAITS, raw);
+  const avitoEff = effectiveIpRotationWaitLimit();
+  return Math.min(WB_IP_ROTATION_MAX_WAITS, Math.max(DEFAULT_IP_ROTATION_WAITS, avitoEff));
 }
 
 /** Стартовая диагностика: прокси и лимит пауз ротации (чтобы не гадать, почему нет 2 мин ожидания). */
@@ -223,7 +232,7 @@ function logProxyAndRotationSettings() {
   }
   const wbIpWaits = effectiveWbIpRotationWaitLimit();
   log(
-    `  Wildberries: при капче/IP те же паузы ~120–130 с; пауз ротации не больше ${WB_IP_ROTATION_MAX_WAITS} (сейчас ${wbIpWaits}, если AVITO_IP_ROTATION_TRIES меньше — берётся меньшее).`
+    `  Wildberries: при капче/IP паузы ~120–130 с; лимит длинных пауз сейчас ${wbIpWaits} (не ниже ${DEFAULT_IP_ROTATION_WAITS}, потолок ${WB_IP_ROTATION_MAX_WAITS}; при AVITO_IP_BLOCK_NO_WAIT=1 и TRIES=0 — без пауз).`
   );
   log(
     `  За один запуск main: до ${Math.max(MAX_RUN_ATTEMPTS_MIN, effectiveIpRotationWaitLimit() + 10)} попыток открыть Avito (с учётом капчи и прочих сбоев).`
