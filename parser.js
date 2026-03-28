@@ -155,6 +155,39 @@ async function detectBlock(page) {
 }
 
 /**
+ * Явное сообщение Avito о пустой выдаче (не путать с «голым» HTML).
+ * @param {import('playwright').Page} page
+ */
+async function hasAvitoEmptySerpMessage(page) {
+  const body = await page.locator('body').innerText().catch(() => '');
+  const low = body.toLowerCase();
+  return (
+    /ничего не найдено|по вашему запросу ничего|объявлений не найдено|подходящих объявлений нет|0\s+объявлен/i.test(
+      low
+    )
+  );
+}
+
+/**
+ * Выдача открылась без JS/CSS: футер/баннеры есть, карточек [data-marker=item] нет.
+ * @param {import('playwright').Page} page
+ */
+async function looksLikeAvitoSkeletonNoItems(page) {
+  return page.evaluate(() => {
+    if (document.querySelectorAll('[data-marker="item"]').length > 0) return false;
+    const h = (location.hostname || '').toLowerCase();
+    if (!h.includes('avito')) return false;
+    const t = document.body ? document.body.innerText || '' : '';
+    if (t.length < 80) return false;
+    const ios = /как дальше пользоваться авито/i.test(t);
+    const foot = /для бизнеса/i.test(t) && /карьера в авито/i.test(t);
+    const catalogs = /каталоги|#япомогаю/i.test(t);
+    const thin = t.length < 5200 && /помощь/i.test(t);
+    return ios || foot || (catalogs && t.length < 9000) || thin;
+  });
+}
+
+/**
  * Спарсить объявления со страницы (несколько вариантов селекторов под вёрстку Avito).
  * @param {import('playwright').Page} page
  * @returns {Promise<Array<{ title: string, priceText: string, priceNum: number|null, href: string, city: string, memoryLabel: string, sellerName: string, publishedLabel: string, sellerKind: string, rating: number|null }>>}
@@ -630,6 +663,8 @@ function saveToExcel(rows, meta) {
 module.exports = {
   buildSearchUrl,
   detectBlock,
+  hasAvitoEmptySerpMessage,
+  looksLikeAvitoSkeletonNoItems,
   parseListings,
   filterListings,
   saveToExcel,

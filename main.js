@@ -19,13 +19,18 @@ const {
 const {
   buildSearchUrl,
   detectBlock,
+  hasAvitoEmptySerpMessage,
+  looksLikeAvitoSkeletonNoItems,
   parseListings,
   filterListings,
   saveToExcel,
 } = require('./parser');
 
-/** Максимум попыток при обычных сетевых / прочих ошибках */
-const MAX_RETRIES = 5;
+/**
+ * Верхняя граница запусков runAttempt за один вызов main (капча/IP, сеть, Excel и т.д.).
+ * Ниже пересчитывается с учётом AVITO_IP_ROTATION_TRIES.
+ */
+const MAX_RUN_ATTEMPTS_MIN = 15;
 
 /** Параметры filterListings из collectParams */
 function listingsFilterOpts(params) {
@@ -87,17 +92,21 @@ async function saveListingsCheckpoint(raw, params, checkpointLabel) {
   }
 }
 
+/** Сколько пауз ротации после IP_BLOCK/капчи по умолчанию (если AVITO_IP_ROTATION_TRIES не задан). */
+const DEFAULT_IP_ROTATION_WAITS = 5;
+
 /**
- * Сколько раз после IP_BLOCK ждать ротацию прокси (120–130 с) и запускать новую попытку.
- * 0 в переменной — для IP_BLOCK всё равно минимум 1 пауза (мобильный прокси), если не задано AVITO_IP_BLOCK_NO_WAIT=1.
- * PowerShell: $env:AVITO_IP_ROTATION_TRIES=2 — до двух пауз; без пауз при блоке только AVITO_IP_BLOCK_NO_WAIT=1
+ * Сколько раз после IP_BLOCK ждать ротацию прокси (120–130 с) и снова запускать браузер.
+ * По умолчанию 5 — чтобы пережить несколько блокировок подряд на мобильном прокси.
+ * 0 в переменной — для IP_BLOCK минимум 1 пауза, если не задано AVITO_IP_BLOCK_NO_WAIT=1.
+ * PowerShell: $env:AVITO_IP_ROTATION_TRIES=3 — ровно три паузы; без пауз: AVITO_IP_BLOCK_NO_WAIT=1
  */
 function maxIpRotationWaits() {
   const raw = process.env.AVITO_IP_ROTATION_TRIES;
   if (raw === '0') return 0;
-  if (raw == null || raw === '') return 1;
+  if (raw == null || raw === '') return DEFAULT_IP_ROTATION_WAITS;
   const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n >= 0 ? n : 1;
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_IP_ROTATION_WAITS;
 }
 
 /** Лимит пауз при IP_BLOCK с учётом минимум одной паузы под ротацию мобильного прокси. */
@@ -124,7 +133,10 @@ function logProxyAndRotationSettings() {
   const rawEnv = process.env.AVITO_IP_ROTATION_TRIES;
   const effRaw = maxIpRotationWaits();
   const effIp = effectiveIpRotationWaitLimit();
-  const shown = rawEnv === undefined || rawEnv === '' ? 'не задано → по умолчанию 1' : `"${rawEnv}"`;
+  const shown =
+    rawEnv === undefined || rawEnv === ''
+      ? `не задано → по умолчанию ${DEFAULT_IP_ROTATION_WAITS}`
+      : `"${rawEnv}"`;
   const skip = process.env.AVITO_IP_BLOCK_NO_WAIT === '1' || process.env.AVITO_IP_BLOCK_NO_WAIT === 'true';
   log(
     `  AVITO_IP_ROTATION_TRIES: ${shown} → пауз 120–130 с при IP_BLOCK: в конфиге ${effRaw}, фактически для повтора ${effIp}${skip ? ' (AVITO_IP_BLOCK_NO_WAIT — без принудительного минимума)' : ''}.`
@@ -132,20 +144,32 @@ function logProxyAndRotationSettings() {
   if (effRaw === 0 && !skip) {
     log('  При 0 в TRIES после блокировки всё равно одна пауза ~2 мин под новый IP; полностью без ожидания: AVITO_IP_BLOCK_NO_WAIT=1');
   }
+  log(
+    `  За один запуск main: до ${Math.max(MAX_RUN_ATTEMPTS_MIN, effectiveIpRotationWaitLimit() + 10)} попыток открыть Avito (с учётом капчи и прочих сбоев).`
+  );
 }
 
 /** Пауза перед повтором после блокировки по IP (мобильный прокси ~2 мин ротация), мс */
 const IP_ROTATION_WAIT_MIN_MS = 120_000;
 const IP_ROTATION_WAIT_MAX_MS = 130_000;
 
-/** Ожидание ответа сервера при переходе на Avito (мс); ждём domcontentloaded */
+/** Ожидание ответа сервера при переходе на Avito (мс); ждём событие load */
 const NAV_TIMEOUT_MS = 180_000;
 
-/** Ожидание появления карточек объявлений в DOM (мс) */
+/** Ожидание появления карточек объявлений в DOM (мс) после последней перезагрузки */
 const SELECTOR_TIMEOUT_MS = 120_000;
 
 /** После навигации ждём событие load перед проверкой капчи и карточек (мс) */
 const PAGE_LOAD_TIMEOUT_MS = 90_000;
+
+/** Перезагрузки вкладки при «голом» DOM без закрытия браузера (капча не трогаем). */
+const MAX_DOM_RELOAD_ATTEMPTS = 3;
+
+/** До первой перезагрузки ждём карточки чуть меньше — быстрее пробуем reload. */
+const CARD_WAIT_BEFORE_FIRST_RELOAD_MS = 50_000;
+
+/** После каждой перезагрузки ждём дольше. */
+const CARD_WAIT_AFTER_DOM_RELOAD_MS = 95_000;
 
 const ITEM_SELECTOR = '[data-marker="item"]';
 
@@ -178,7 +202,7 @@ async function gateListingPageReady(page, pageLabel, hooks, options = {}) {
     );
   });
 
-  await randomDelay(3500, 8000);
+  await randomDelay(1800, 4200);
 
   if (isFirstPage) {
     logStep(7, 'Проверка на капчу / ограничение доступа', pageLabel);
@@ -197,19 +221,89 @@ async function gateListingPageReady(page, pageLabel, hooks, options = {}) {
     logStep(
       8,
       'Ожидание карточек объявлений в DOM',
-      `селектор ${ITEM_SELECTOR}, таймаут ${SELECTOR_TIMEOUT_MS / 1000} с`
+      `селектор ${ITEM_SELECTOR}; при «голом» HTML — до ${MAX_DOM_RELOAD_ATTEMPTS} перезагрузок вкладки без закрытия браузера`
     );
   } else {
-    log(`  [${pageLabel}] капчи нет — ожидание карточек (${SELECTOR_TIMEOUT_MS / 1000} с)…`);
+    log(
+      `  [${pageLabel}] ожидание карточек; при сбое вёрстки — перезагрузка вкладки (до ${MAX_DOM_RELOAD_ATTEMPTS} раз)…`
+    );
   }
-  try {
-    await page.waitForSelector(ITEM_SELECTOR, { timeout: SELECTOR_TIMEOUT_MS });
-  } catch {
-    if (await detectBlock(page)) {
-      logBlock(`[${pageLabel}] карточек нет — при повторной проверке виден блок / капча`);
-      hooks.onIpBlock();
+
+  let gotCards = false;
+  for (let domTry = 0; domTry <= MAX_DOM_RELOAD_ATTEMPTS; domTry++) {
+    if (domTry > 0) {
+      log(
+        `  [${pageLabel}] перезагрузка страницы в той же сессии (${domTry}/${MAX_DOM_RELOAD_ATTEMPTS}) — восстановление DOM…`
+      );
+      try {
+        const resp = await page.reload({ waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
+        if (resp) {
+          const st = resp.status();
+          if (st === 403 || st === 429) {
+            log(`  ответ после перезагрузки: HTTP ${st} — ограничение по IP`);
+            logNetFailureHelp(new Error(`HTTP ${st}`));
+            hooks.onIpBlock();
+          }
+          if (st >= 400) {
+            throw new Error(`Перезагрузка Avito: HTTP ${st}`);
+          }
+        }
+      } catch (reloadErr) {
+        const m = reloadErr && reloadErr.message ? reloadErr.message : String(reloadErr);
+        if (m === 'IP_BLOCK') throw reloadErr;
+        if (isLikelyProxyOrTunnelDrop(reloadErr)) {
+          logNetFailureHelp(reloadErr);
+          hooks.onIpBlock();
+        }
+        throw reloadErr;
+      }
+      await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
+      await randomDelay(2000, 4500);
+      if (await detectBlock(page)) {
+        logBlock(`[${pageLabel}] после перезагрузки — капча / блок`);
+        hooks.onIpBlock();
+      }
     }
-    log(`  [${pageLabel}] не дождались карточек за ${SELECTOR_TIMEOUT_MS / 1000} с`);
+
+    const waitMs = domTry === 0 ? CARD_WAIT_BEFORE_FIRST_RELOAD_MS : CARD_WAIT_AFTER_DOM_RELOAD_MS;
+    try {
+      await page.waitForSelector(ITEM_SELECTOR, { timeout: waitMs });
+      gotCards = true;
+      break;
+    } catch {
+      if (await detectBlock(page)) {
+        logBlock(`[${pageLabel}] карточек нет — при проверке виден блок / капча`);
+        hooks.onIpBlock();
+      }
+      if (await hasAvitoEmptySerpMessage(page)) {
+        throw new Error(
+          'Avito: пустая выдача по запросу (на странице сообщение о том, что ничего не найдено).'
+        );
+      }
+      const skeleton = await looksLikeAvitoSkeletonNoItems(page);
+      if (domTry >= MAX_DOM_RELOAD_ATTEMPTS) {
+        log(
+          `  [${pageLabel}] карточек нет после ${MAX_DOM_RELOAD_ATTEMPTS} перезагрузок вкладки`
+        );
+        throw new Error(
+          'На странице не появились объявления за отведённое время. Проверьте прокси, запрос или вёрстку Avito.'
+        );
+      }
+      if (skeleton) {
+        log(`  [${pageLabel}] похоже на страницу без нормальной вёрстки выдачи (скелет HTML)`);
+        continue;
+      }
+      if (domTry === 0) {
+        log(`  [${pageLabel}] карточек нет — одна перезагрузка вкладки на случай медленной подгрузки JS…`);
+        continue;
+      }
+      throw new Error(
+        'На странице не появились объявления за отведённое время. Проверьте прокси, запрос или вёрстку Avito.'
+      );
+    }
+  }
+
+  if (!gotCards) {
     throw new Error(
       'На странице не появились объявления за отведённое время. Проверьте прокси, запрос или вёрстку Avito.'
     );
@@ -233,8 +327,8 @@ const LIST_PAGE_SCROLL_MAX = 5;
  * Мягкий «человеческий» темп: длиннее ждём, мельче крутим колёсико — меньше резких движений после входа.
  */
 const SOFT = {
-  beforeGotoMin: 1500,
-  beforeGotoMax: 4000,
+  beforeGotoMin: 600,
+  beforeGotoMax: 2200,
   afterNavMin: 6500,
   afterNavMax: 13000,
   warmupScrollsMin: 5,
@@ -245,12 +339,12 @@ const SOFT = {
   warmupPauseMax: 6500,
   beforeCardsMin: 4000,
   beforeCardsMax: 9000,
-  humanRoundsMin: 6,
-  humanRoundsMax: 10,
+  humanRoundsMin: 5,
+  humanRoundsMax: 8,
   humanWheelMin: 90,
   humanWheelMax: 320,
-  humanPauseMin: 5000,
-  humanPauseMax: 11000,
+  humanPauseMin: 3500,
+  humanPauseMax: 8000,
   towardBottomStepsMin: 5,
   towardBottomStepsMax: 9,
   towardBottomPauseMin: 2500,
@@ -638,11 +732,11 @@ async function runAttempt(params) {
     logStep(
       5,
       'Переход на Avito',
-      `ожидание domcontentloaded, таймаут ${NAV_TIMEOUT_MS / 1000} с`
+      `ожидание load (полнее, чем domcontentloaded), таймаут ${NAV_TIMEOUT_MS / 1000} с`
     );
 
     try {
-      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+      const response = await page.goto(url, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
       if (response) {
         const st = response.status();
         if (st === 403 || st === 429) {
@@ -671,7 +765,7 @@ async function runAttempt(params) {
       throw navErr;
     }
 
-    log('  после domcontentloaded: полная загрузка, капча и карточки — единая проверка (шаги 6–8 в логе)');
+    log('  после перехода: load, капча и карточки — единая проверка (шаги 6–8 в логе)');
     await gateListingPageReady(page, 'страница выдачи 1', ipHooks, { isFirstPage: true });
 
     log('  короткая пауза перед сбором данных со страницы…');
@@ -817,11 +911,12 @@ async function main() {
   let ipRotationWaitsDone = 0;
   const ipWaitLimitRaw = maxIpRotationWaits();
   const ipWaitLimit = effectiveIpRotationWaitLimit();
+  const maxRunAttempts = Math.max(MAX_RUN_ATTEMPTS_MIN, ipWaitLimit + 10);
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 1; attempt <= maxRunAttempts; attempt++) {
     try {
       if (attempt > 1) {
-        logRetry(`попытка ${attempt} из ${MAX_RETRIES}`);
+        logRetry(`попытка ${attempt} из ${maxRunAttempts}`);
       }
       await runAttempt(params);
       return;
@@ -854,7 +949,7 @@ async function main() {
   }
 
   console.error(
-    `Не удалось завершить работу за ${MAX_RETRIES} попыток. Последняя ошибка:`,
+    `Не удалось завершить работу за ${maxRunAttempts} попыток. Последняя ошибка:`,
     lastErr
   );
   process.exit(1);
