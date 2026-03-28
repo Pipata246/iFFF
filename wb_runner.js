@@ -7,10 +7,12 @@ const { launchBrowser, newStealthContext, isProxyDisabled, PROXY_URL } = require
 const {
   log,
   logStep,
+  logBlock,
   randomDelay,
   randomInt,
   dedupeByHref,
   resultsPath,
+  waitEnterBeforeCloseBrowser,
 } = require('./utils');
 const { detectBlock, saveToExcel } = require('./parser');
 const {
@@ -26,6 +28,34 @@ const {
 let resumeListingUrlWb = null;
 let resumeSerpPageIndexWb = null;
 
+/**
+ * @param {{ domGateCtx: { page: import('playwright').Page | null }, crawlState: { serpPageIndex: number }, openUrl: string }} ctx
+ */
+function rememberWbListingForIpRetry(ctx) {
+  const { domGateCtx, crawlState, openUrl } = ctx;
+  let url = openUrl;
+  try {
+    const p = domGateCtx.page;
+    if (p && typeof p.url === 'function') {
+      const u = p.url();
+      if (u && /wildberries\.ru/i.test(u) && !/^(chrome-error|about:|chrome:\/\/)/i.test(u)) {
+        url = u;
+      }
+    }
+  } catch (_) {
+    /* keep openUrl */
+  }
+  if (!/wildberries\.ru/i.test(url)) {
+    url = openUrl;
+  }
+  resumeListingUrlWb = url;
+  resumeSerpPageIndexWb = crawlState.serpPageIndex;
+  log(
+    `  WB: капча / IP-блок — сохранена позиция выдачи (стр. ${resumeSerpPageIndexWb}); закроем браузер и повторим после ротации мобильного прокси.`
+  );
+  log(`  ${resumeListingUrlWb}`);
+}
+
 const NAV_TIMEOUT_MS = 180_000;
 const SELECTOR_TIMEOUT_MS = 120_000;
 const PAGE_LOAD_TIMEOUT_MS = 90_000;
@@ -39,9 +69,47 @@ const LIST_PAGE_SCROLL_MAX = 5;
 const WB_ITEM_SELECTOR =
   'article.product-card__wrapper, article[data-nm-id], article.product-card';
 
+/**
+ * Код ответа на главный документ часто приходит от прокси/CDN (например 498) до готовности SPA.
+ * Не завершаем сценарий сразу — ждём загрузку и даём гейту проверить карточки.
+ */
+const WB_NAV_SOFT_HTTP = new Set([408, 425, 498, 499, 500, 502, 503, 504]);
+
+/**
+ * @param {import('playwright').Page} page
+ * @param {number} reportedStatus
+ */
+async function waitForWbDomAfterSoftHttp(page, reportedStatus) {
+  log(
+    `  главный ответ HTTP ${reportedStatus} — часто «шум» прокси до готовности WB; ждём load и догрузку вёрстки…`
+  );
+  await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch((e) => {
+    log(`  повторное ожидание load: ${String(e.message || e).slice(0, 96)}`);
+  });
+  await page.waitForLoadState('domcontentloaded', { timeout: 45_000 }).catch(() => {});
+  await randomDelay(6000, 12_000);
+  const n = await page.locator(WB_ITEM_SELECTOR).count().catch(() => 0);
+  if (n === 0) {
+    log('  карточек в DOM ещё нет — одна перезагрузка вкладки после мягкого HTTP…');
+    try {
+      await page.reload({ waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
+    } catch (e) {
+      log(`  reload после HTTP ${reportedStatus}: ${String(e.message || e).slice(0, 96)}`);
+    }
+    await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
+    await randomDelay(5000, 9000);
+  }
+}
+
 const SOFT = {
   beforeGotoMin: 600,
   beforeGotoMax: 2200,
+  /** После гейта выдачи — как «осмотр страницы» перед парсингом (сопоставимо с паузой Avito). */
+  afterListingGateMin: 6500,
+  afterListingGateMax: 13_000,
+  /** WB: дольше «остываем» после load перед проверкой капчи (жёсткая защита). */
+  wbSettleAfterLoadMin: 4500,
+  wbSettleAfterLoadMax: 10_000,
   warmupScrollsMin: 5,
   warmupScrollsMax: 8,
   warmupWheelMin: 70,
@@ -80,22 +148,6 @@ function waitProxyManualGate() {
   });
 }
 
-function waitEnterBeforeCloseBrowser() {
-  if (process.env.AVITO_AUTO_CLOSE === '1' || process.env.AVITO_AUTO_CLOSE === 'true') {
-    return Promise.resolve();
-  }
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(
-      '>>> Окно браузера остаётся открытым (WB). Нажмите Enter здесь, чтобы закрыть Chromium… ',
-      () => {
-        rl.close();
-        resolve();
-      }
-    );
-  });
-}
-
 function logNetFailureHelp(err) {
   const s = String(err && err.message ? err.message : err);
   if (!s.includes('ERR_') && !s.includes('net::') && !s.includes('HTTP')) return;
@@ -130,30 +182,62 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
   };
 
   if (isFirstPage) {
-    logStep(6, 'Загрузка выдачи Wildberries', `${pageLabel} — load, затем проверка блокировки и карточек`);
+    logStep(
+      6,
+      'Загрузка выдачи Wildberries',
+      `${pageLabel} — событие load, затем капча и карточки в DOM (как на Avito)`
+    );
   } else {
-    log(`  [${pageLabel}] WB: load → блок → карточки`);
+    log(`  [${pageLabel}] WB: load → капча / блок → карточки в DOM`);
   }
 
   await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch((e) => {
-    log(`  [${pageLabel}] load не за таймаут — продолжаем (${String(e.message).slice(0, 80)})`);
+    log(
+      `  [${pageLabel}] load не за ${PAGE_LOAD_TIMEOUT_MS / 1000} с — продолжаем (${String(
+        e.message
+      ).slice(0, 96)})`
+    );
   });
-  await randomDelay(1800, 4200);
 
+  await randomDelay(SOFT.wbSettleAfterLoadMin, SOFT.wbSettleAfterLoadMax);
+
+  if (isFirstPage) {
+    logStep(7, 'Проверка на капчу / ограничение (WB)', pageLabel);
+  } else {
+    log(`  [${pageLabel}] WB: проверка капчи / антибота…`);
+  }
   if (await detectBlock(page)) {
-    log(`  [${pageLabel}] похоже на капчу / ограничение`);
+    logBlock(`[${pageLabel}] Wildberries — капча или экран ограничения; закрываем браузер и ждём новый IP`);
     hooks.onIpBlock();
+  }
+  if (isFirstPage) {
+    logStep(7, 'Ограничений в тексте и виджетах не видно (WB)', 'продолжаем');
+  }
+
+  if (isFirstPage) {
+    logStep(
+      8,
+      'Ожидание карточек товаров в DOM',
+      `${WB_ITEM_SELECTOR}; при «голом» HTML — до ${MAX_DOM_RELOAD_ATTEMPTS} перезагрузок вкладки (капчу не трогаем — только новый IP)`
+    );
+  } else {
+    log(
+      `  [${pageLabel}] WB: ожидание карточек; перезагрузка вкладки без смены IP только если нет капчи…`
+    );
   }
 
   let gotCards = false;
   for (let domTry = 0; domTry <= MAX_DOM_RELOAD_ATTEMPTS; domTry++) {
     if (domTry > 0) {
-      log(`  [${pageLabel}] перезагрузка вкладки WB (${domTry}/${MAX_DOM_RELOAD_ATTEMPTS})…`);
+      log(
+        `  [${pageLabel}] перезагрузка страницы WB в той же сессии (${domTry}/${MAX_DOM_RELOAD_ATTEMPTS})…`
+      );
       try {
         const resp = await page.reload({ waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
         if (resp) {
           const st = resp.status();
           if (st === 403 || st === 429) {
+            log(`  ответ после перезагрузки: HTTP ${st} — ограничение по IP`);
             logNetFailureHelp(new Error(`HTTP ${st}`));
             hooks.onIpBlock();
           }
@@ -169,8 +253,11 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
         throw reloadErr;
       }
       await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
-      await randomDelay(2000, 4500);
-      if (await detectBlock(page)) hooks.onIpBlock();
+      await randomDelay(SOFT.wbSettleAfterLoadMin, SOFT.wbSettleAfterLoadMax);
+      if (await detectBlock(page)) {
+        logBlock(`[${pageLabel}] после перезагрузки WB — капча / блок`);
+        hooks.onIpBlock();
+      }
     }
 
     const waitMs = domTry === 0 ? CARD_WAIT_BEFORE_FIRST_RELOAD_MS : CARD_WAIT_AFTER_DOM_RELOAD_MS;
@@ -179,21 +266,35 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
       gotCards = true;
       break;
     } catch {
-      if (await detectBlock(page)) hooks.onIpBlock();
+      if (await detectBlock(page)) {
+        logBlock(`[${pageLabel}] карточек нет — при проверке видна капча / блок WB`);
+        hooks.onIpBlock();
+      }
       if (await hasWbEmptySerpMessage(page)) {
         throw new Error('Wildberries: пустая выдача по запросу.');
       }
       const skeleton = await looksLikeWbSkeletonNoItems(page);
       if (domTry >= MAX_DOM_RELOAD_ATTEMPTS) {
+        log(`  [${pageLabel}] карточек нет после ${MAX_DOM_RELOAD_ATTEMPTS} перезагрузок вкладки`);
         markDomGateFailedAutoClose();
         throw new Error(
-          'На странице WB не появились карточки товаров. Проверьте прокси или вёрстку сайта.'
+          'На странице WB не появились карточки товаров. Проверьте прокси, запрос или вёрстку сайта.'
         );
       }
-      if (skeleton) continue;
-      if (domTry === 0) continue;
+      if (skeleton) {
+        log(`  [${pageLabel}] похоже на страницу без нормальной вёрстки выдачи WB`);
+        continue;
+      }
+      if (domTry === 0) {
+        log(
+          `  [${pageLabel}] карточек нет — одна перезагрузка вкладки на случай медленной подгрузки JS…`
+        );
+        continue;
+      }
       markDomGateFailedAutoClose();
-      throw new Error('На странице WB не появились карточки товаров за отведённое время.');
+      throw new Error(
+        'На странице WB не появились карточки товаров за отведённое время. Проверьте прокси или вёрстку.'
+      );
     }
   }
 
@@ -203,7 +304,11 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
   }
 
   const cnt = await page.locator(WB_ITEM_SELECTOR).count();
-  log(`  [${pageLabel}] карточек WB в DOM: ${cnt}`);
+  if (isFirstPage) {
+    logStep(8, 'Карточки товаров WB в DOM', `${cnt} шт.`);
+  } else {
+    log(`  [${pageLabel}] карточек WB в DOM: ${cnt} шт.`);
+  }
 }
 
 async function gentleWarmupScroll(page) {
@@ -407,6 +512,7 @@ async function runAttemptWb(params, opts = {}) {
     extraKeywords: params.extraKeywords,
     minPrice: params.minPrice,
     maxPrice: params.maxPrice,
+    memory: params.memory,
     page: 1,
   });
 
@@ -423,9 +529,24 @@ async function runAttemptWb(params, opts = {}) {
     );
   }
 
-  const crawlState = { serpPageIndex: 1 };
+  const crawlState = {
+    serpPageIndex: savedResumePageIdx != null ? savedResumePageIdx : 1,
+  };
 
   logStep(1, 'Запуск браузера (Wildberries)', isProxyDisabled() ? 'без прокси' : 'с прокси');
+  if (isProxyDisabled()) {
+    log('  WB: AVITO_NO_PROXY — без прокси, тот же режим, что у Avito.');
+  } else {
+    try {
+      const u = new URL(PROXY_URL);
+      const port = u.port || (u.protocol === 'https:' ? '443' : '80');
+      log(
+        `  WB: используется тот же мобильный HTTP-прокси, что и у Avito — ${u.hostname}:${port} (browser.js).`
+      );
+    } catch {
+      log('  WB: прокси из browser.js — общий с Avito.');
+    }
+  }
   const browser = await launchBrowser();
   const context = await newStealthContext(browser);
   const page = await context.newPage();
@@ -436,6 +557,7 @@ async function runAttemptWb(params, opts = {}) {
   const ipHooks = {
     onIpBlock() {
       skipEnterBeforeClose = true;
+      rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
       throw new Error('IP_BLOCK');
     },
   };
@@ -463,14 +585,36 @@ async function runAttemptWb(params, opts = {}) {
     logStep(4, 'Адрес поиска Wildberries', openUrl);
 
     try {
-      const response = await page.goto(openUrl, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
+      /** @type {import('playwright').Response | null} */
+      let response = null;
+      try {
+        response = await page.goto(openUrl, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
+      } catch (gotoErr) {
+        const gm = gotoErr && gotoErr.message ? gotoErr.message : String(gotoErr);
+        if (gm === 'IP_BLOCK') throw gotoErr;
+        if (isLikelyProxyOrTunnelDrop(gotoErr)) {
+          skipEnterBeforeClose = true;
+          rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+          throw new Error('IP_BLOCK');
+        }
+        log(
+          `  WB: переход прервался (${gm.slice(0, 120)}) — ждём, пока страница догрузится в текущей вкладке…`
+        );
+        await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
+        await randomDelay(6000, 12_000);
+        response = null;
+      }
+
       if (response) {
         const st = response.status();
         if (st === 403 || st === 429) {
           skipEnterBeforeClose = true;
+          rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
           throw new Error('IP_BLOCK');
         }
-        if (st >= 400) {
+        if (WB_NAV_SOFT_HTTP.has(st)) {
+          await waitForWbDomAfterSoftHttp(page, st);
+        } else if (st >= 400) {
           logNetFailureHelp(new Error(`HTTP ${st}`));
           throw new Error(`WB: HTTP ${st}`);
         }
@@ -478,14 +622,15 @@ async function runAttemptWb(params, opts = {}) {
     } catch (navErr) {
       const m = navErr && navErr.message ? navErr.message : String(navErr);
       if (m === 'IP_BLOCK') throw navErr;
+      if (/^WB: HTTP \d+/i.test(m)) throw navErr;
       if (isLikelyProxyOrTunnelDrop(navErr)) {
         skipEnterBeforeClose = true;
+        rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
         throw new Error('IP_BLOCK');
       }
       throw navErr;
     }
 
-    crawlState.serpPageIndex = savedResumePageIdx != null ? savedResumePageIdx : 1;
     await gateWbListingPageReady(
       page,
       openingFromResume ? 'возобновление выдачи WB' : 'страница 1',
@@ -507,12 +652,14 @@ async function runAttemptWb(params, opts = {}) {
     }
     crawlState.serpPageIndex = listingPageIdx;
 
-    await randomDelay(2500, 5500);
+    log('  пауза перед сбором данных с выдачи WB (осторожный осмотр страницы, как на Avito)…');
+    await randomDelay(SOFT.afterListingGateMin, SOFT.afterListingGateMax);
     let raw = [];
     let batch = await parseWbListings(page);
     raw.push(...batch);
     log(`  WB собрано записей (первый проход): ${batch.length}`);
 
+    logStep(10, 'Скролл выдачи Wildberries', 'имитация чтения и догрузка карточек');
     await humanBehavior(page);
     await scrollForMoreWbListings(page);
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
@@ -557,8 +704,10 @@ async function runAttemptWb(params, opts = {}) {
       );
 
       await page.evaluate(() => window.scrollTo(0, 0));
-      await randomDelay(2000, 4500);
+      await randomDelay(2500, 5500);
       await gentleWarmupScroll(page);
+      log(`  WB стр. ${listingPageIdx}: имитация чтения перед скроллом…`);
+      await humanBehavior(page);
       await scrollForMoreWbListings(page);
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await randomDelay(2500, 5000);
@@ -580,11 +729,13 @@ async function runAttemptWb(params, opts = {}) {
     raw = dedupeByHref(raw);
     const filtered = filterWbListings(raw, wbListingsFilterOpts(params));
     log(`  WB итого после фильтров: ${filtered.length}`);
+    resumeListingUrlWb = null;
+    resumeSerpPageIndexWb = null;
     return filtered;
   } finally {
     if (!skipEnterBeforeClose) {
-      logStep(15, 'Пауза перед закрытием (WB)', '');
-      await waitEnterBeforeCloseBrowser();
+      logStep(15, 'Закрытие браузера (WB)', 'пауза только если AVITO_WAIT_ENTER=1');
+      await waitEnterBeforeCloseBrowser('Wildberries');
     } else {
       log('  WB: закрываем браузер без Enter (блок / сбой / повтор).');
     }

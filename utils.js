@@ -4,6 +4,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 
 /** Путь к xlsx на текущий запуск node main.js (после initSessionResultsOutput). */
 let sessionResultsPath = null;
@@ -250,6 +251,34 @@ function resultsPath() {
   return path.join(__dirname, 'results.xlsx');
 }
 
+/**
+ * После успешного парсинга по умолчанию Chromium закрывается без паузы в консоли.
+ * Чтобы снова ждать Enter перед закрытием (просмотр страницы): AVITO_WAIT_ENTER=1
+ * AVITO_AUTO_CLOSE=1 — то же, что поведение по умолчанию (без ожидания).
+ * @param {string} [promptSuffix] — доп. текст к подсказке (например «Avito» / «WB»)
+ * @returns {Promise<void>}
+ */
+function waitEnterBeforeCloseBrowser(promptSuffix) {
+  const waitEnter =
+    process.env.AVITO_WAIT_ENTER === '1' || process.env.AVITO_WAIT_ENTER === 'true';
+  const forceSkip =
+    process.env.AVITO_AUTO_CLOSE === '1' || process.env.AVITO_AUTO_CLOSE === 'true';
+  if (!waitEnter || forceSkip) {
+    return Promise.resolve();
+  }
+  const extra = promptSuffix ? ` (${promptSuffix})` : '';
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(
+      `>>> Окно браузера открыто${extra} — нажмите Enter в консоли, чтобы закрыть Chromium… `,
+      () => {
+        rl.close();
+        resolve();
+      }
+    );
+  });
+}
+
 module.exports = {
   log,
   logStep,
@@ -267,4 +296,5 @@ module.exports = {
   dedupeByHref,
   resultsPath,
   initSessionResultsOutput,
+  waitEnterBeforeCloseBrowser,
 };

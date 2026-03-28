@@ -15,6 +15,7 @@ const {
   dedupeByHref,
   resultsPath,
   initSessionResultsOutput,
+  waitEnterBeforeCloseBrowser,
 } = require('./utils');
 const {
   buildSearchUrl,
@@ -62,6 +63,36 @@ function parseSerpPageIndexFromUrl(urlStr) {
   return 1;
 }
 
+/**
+ * При IP-блоке / капче запоминаем текущий URL выдачи и номер страницы — после ротации IP следующий runAttempt
+ * откроет ту же вкладку (ту же позицию в поиске), а не первую страницу с нуля.
+ * @param {{ domGateCtx: { page: import('playwright').Page | null }, crawlState: { serpPageIndex: number }, openUrl: string }} ctx
+ */
+function rememberAvitoListingForIpRetry(ctx) {
+  const { domGateCtx, crawlState, openUrl } = ctx;
+  let url = openUrl;
+  try {
+    const p = domGateCtx.page;
+    if (p && typeof p.url === 'function') {
+      const u = p.url();
+      if (u && /avito\.ru/i.test(u) && !/^(chrome-error|about:|chrome:\/\/)/i.test(u)) {
+        url = u;
+      }
+    }
+  } catch (_) {
+    /* keep openUrl */
+  }
+  if (!/avito\.ru/i.test(url)) {
+    url = openUrl;
+  }
+  resumeListingUrl = url;
+  resumeSerpPageIndex = crawlState.serpPageIndex;
+  log(
+    `  IP-блок / капча: сохранена позиция выдачи (стр. ${resumeSerpPageIndex}) — после смены IP откроем тот же адрес.`
+  );
+  log(`  ${resumeListingUrl}`);
+}
+
 /** Параметры filterListings из collectParams */
 function listingsFilterOpts(params) {
   return {
@@ -100,10 +131,7 @@ function isExcelFileBusyError(e) {
  */
 async function saveListingsCheckpoint(raw, params, checkpointLabel) {
   const filtered = filterListings(dedupeByHref(raw), listingsFilterOpts(params));
-  const rowsForExcel =
-    params.marketplace === 'both'
-      ? filtered.map((r) => ({ ...r, marketplace: 'Avito' }))
-      : filtered;
+  const rowsForExcel = filtered.map((r) => ({ ...r, marketplace: 'Avito' }));
   const excelMeta =
     sessionFilterExportRows && sessionFilterExportRows.length > 0
       ? { checkpoint: checkpointLabel, filterExportRows: sessionFilterExportRows }
@@ -540,27 +568,6 @@ function waitProxyManualGate() {
 }
 
 /**
- * Держим окно открытым, пока вы не нажмёте Enter в консоли.
- * Автозакрытие без паузы: AVITO_AUTO_CLOSE=1
- * @returns {Promise<void>}
- */
-function waitEnterBeforeCloseBrowser() {
-  if (process.env.AVITO_AUTO_CLOSE === '1' || process.env.AVITO_AUTO_CLOSE === 'true') {
-    return Promise.resolve();
-  }
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(
-      '>>> Окно браузера остаётся открытым — посмотрите, что на странице. Нажмите Enter здесь, чтобы закрыть Chromium… ',
-      () => {
-        rl.close();
-        resolve();
-      }
-    );
-  });
-}
-
-/**
  * Пояснение при net::ERR_HTTP_RESPONSE_CODE_FAILURE и т.п.
  * @param {unknown} err
  */
@@ -819,7 +826,9 @@ async function runAttempt(params) {
     );
   }
 
-  const crawlState = { serpPageIndex: 1 };
+  const crawlState = {
+    serpPageIndex: savedResumePageIdx != null ? savedResumePageIdx : 1,
+  };
 
   logStep(
     1,
@@ -840,6 +849,7 @@ async function runAttempt(params) {
   const ipHooks = {
     onIpBlock() {
       skipEnterBeforeClose = true;
+      rememberAvitoListingForIpRetry({ domGateCtx, crawlState, openUrl });
       throw new Error('IP_BLOCK');
     },
   };
@@ -888,6 +898,7 @@ async function runAttempt(params) {
           log(`  ответ сервера: HTTP ${st} — ограничение по IP / частота запросов`);
           logNetFailureHelp(new Error(`HTTP ${st}`));
           skipEnterBeforeClose = true;
+          rememberAvitoListingForIpRetry({ domGateCtx, crawlState, openUrl });
           throw new Error('IP_BLOCK');
         }
         if (st >= 400) {
@@ -904,6 +915,7 @@ async function runAttempt(params) {
         logNetFailureHelp(navErr);
         log('  Считаем это сбоем канала через прокси → пауза ротации (как при IP_BLOCK), затем повтор при лимите AVITO_IP_ROTATION_TRIES.');
         skipEnterBeforeClose = true;
+        rememberAvitoListingForIpRetry({ domGateCtx, crawlState, openUrl });
         throw new Error('IP_BLOCK');
       }
       logNetFailureHelp(navErr);
@@ -911,7 +923,6 @@ async function runAttempt(params) {
     }
 
     log('  после перехода: load, капча и карточки — единая проверка (шаги 6–8 в логе)');
-    crawlState.serpPageIndex = savedResumePageIdx != null ? savedResumePageIdx : 1;
     await gateListingPageReady(
       page,
       openingFromResume ? 'возобновление сохранённой выдачи' : 'страница выдачи 1',
@@ -961,6 +972,7 @@ async function runAttempt(params) {
     if (await detectBlock(page)) {
       logBlock('после прокрутки');
       skipEnterBeforeClose = true;
+      rememberAvitoListingForIpRetry({ domGateCtx, crawlState, openUrl });
       throw new Error('IP_BLOCK');
     }
     log('  блокировка не обнаружена');
@@ -1041,11 +1053,13 @@ async function runAttempt(params) {
       `${resultsPath()} — ${filtered.length} подходящих (Excel обновлялся после каждой обработанной страницы выдачи)`
     );
 
+    resumeListingUrl = null;
+    resumeSerpPageIndex = null;
     return filtered;
   } finally {
     if (!skipEnterBeforeClose) {
-      logStep(15, 'Пауза перед закрытием браузера', 'смотрите окно Chromium');
-      await waitEnterBeforeCloseBrowser();
+      logStep(15, 'Закрытие браузера', 'пауза только если AVITO_WAIT_ENTER=1');
+      await waitEnterBeforeCloseBrowser('Avito');
     } else {
       log(
         '  Закрываем браузер без ожидания Enter (блок IP / сбой DOM / следующая попытка в main).'
@@ -1114,7 +1128,7 @@ async function runIpRetryLoop(label, fn) {
 
 async function main() {
   log('СТАРТ — парсер Avito / Wildberries (Playwright, Excel)');
-  log('  Браузер закроется после Enter в консоли (или AVITO_AUTO_CLOSE=1).');
+  log('  По завершении парсинга браузер закрывается сам. Чтобы ждать Enter в консоли: AVITO_WAIT_ENTER=1.');
   logProxyAndRotationSettings();
 
   let params;

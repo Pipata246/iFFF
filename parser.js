@@ -130,12 +130,51 @@ function buildSearchUrl(p) {
 }
 
 /**
- * Проверка текста страницы на явную блокировку / капчу Avito.
- * Не используем короткие вроде «капч» / «captcha» — они дают ложные срабатывания в обычной вёрстке.
+ * Капча / антибот в iframe и типовых блоках (Wildberries, Cloudflare, hCaptcha и т.д.).
+ * @param {import('playwright').Page} page
+ * @returns {Promise<boolean>}
+ */
+async function detectCaptchaFramesOrWidgets(page) {
+  return page.evaluate(() => {
+    const iframes = Array.from(document.querySelectorAll('iframe'));
+    for (const f of iframes) {
+      const s = (f.getAttribute('src') || '').toLowerCase();
+      if (
+        s.includes('hcaptcha') ||
+        s.includes('recaptcha') ||
+        s.includes('captcha') ||
+        s.includes('challenges.cloudflare') ||
+        s.includes('turnstile') ||
+        s.includes('/captcha/')
+      ) {
+        return true;
+      }
+    }
+    const candidates = document.querySelectorAll('[class*="captcha"], [id*="captcha"], [data-marker*="captcha"]');
+    for (const el of candidates) {
+      const cls = (el.getAttribute('class') || '').toLowerCase();
+      const id = ((el.id && el.id) || '').toLowerCase();
+      if (!cls.includes('captcha') && !id.includes('captcha')) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 40 && r.height > 40) return true;
+    }
+    return false;
+  });
+}
+
+/**
+ * Проверка текста страницы на явную блокировку / капчу (Avito, Wildberries, CDN).
+ * Не используем слишком короткие совпадения без контекста.
  * @param {import('playwright').Page} page
  * @returns {Promise<boolean>}
  */
 async function detectBlock(page) {
+  try {
+    if (await detectCaptchaFramesOrWidgets(page)) return true;
+  } catch (_) {
+    /* ignore */
+  }
+
   const body = await page.locator('body').innerText().catch(() => '');
   const low = body.toLowerCase();
   const phrases = [
@@ -148,6 +187,22 @@ async function detectBlock(page) {
     'yandex smartcaptcha',
     'smartcaptcha',
     'пройдите проверку',
+    'подозрительная активность',
+    'проверка браузера',
+    'проверяем ваш браузер',
+    'докажите, что вы не робот',
+    'подтвердите, что вы человек',
+    'проверка безопасности',
+    'слишком много действий',
+    'ваш запрос был отклон',
+    'обновите страницу через',
+    'доступ с ip временно ограничен',
+    'request blocked',
+    'attention required',
+    'just a moment',
+    'checking your browser',
+    'не удалось загрузить страницу',
+    'попробуйте обновить страницу',
   ];
   if (phrases.some((p) => low.includes(p))) return true;
   if (/\bкапча\b/i.test(body)) return true;
@@ -612,6 +667,7 @@ function buildSearchParamsExportRows(params) {
 }
 
 const EXCEL_LIST_HEADERS = [
+  'Площадка',
   'Название',
   'Цена',
   'Память',
@@ -626,13 +682,18 @@ const EXCEL_LIST_HEADERS = [
 /**
  * Сохранить xlsx: лист объявлений (поля с карточки) и при передаче searchParams — лист фильтров запуска.
  * @param {Array<{ title: string, priceText: string, priceNum?: number|null, href: string, city: string, memoryLabel?: string, sellerName?: string, sellerKind?: string, rating?: number|null, publishedLabel?: string, marketplace?: string }>} rows
- * @param {{ checkpoint?: string, searchParams?: SearchParams & { memory?: string, minRating?: number, onlyToday?: boolean }, filterExportRows?: Array<{ Параметр: string, Значение: string }> }} [meta]
+ * @param {{ checkpoint?: string, searchParams?: SearchParams & { memory?: string, minRating?: number, onlyToday?: boolean }, filterExportRows?: Array<{ Параметр: string, Значение: string }>, defaultMarketplace?: string }} [meta]
  */
 function saveToExcel(rows, meta) {
   const m = meta && typeof meta === 'object' ? meta : {};
-  const showMarketplace = rows.some((r) => r && typeof r.marketplace === 'string' && r.marketplace !== '');
+  const defaultPl = m.defaultMarketplace && String(m.defaultMarketplace).trim() !== '' ? m.defaultMarketplace : '';
   const sheetRows = rows.map((r) => {
-    const row = {
+    const pl =
+      r.marketplace && String(r.marketplace).trim() !== ''
+        ? r.marketplace
+        : defaultPl || '—';
+    return {
+      Площадка: pl,
       Название: r.title,
       Цена: r.priceText || (r.priceNum != null ? String(r.priceNum) : ''),
       Память: r.memoryLabel != null && String(r.memoryLabel).trim() !== '' ? r.memoryLabel : '—',
@@ -644,10 +705,6 @@ function saveToExcel(rows, meta) {
       Город: r.city,
       Ссылка: r.href,
     };
-    if (showMarketplace) {
-      row['Площадка'] = r.marketplace && String(r.marketplace).trim() !== '' ? r.marketplace : '—';
-    }
-    return row;
   });
   const ws = sheetRows.length
     ? XLSX.utils.json_to_sheet(sheetRows)
@@ -676,6 +733,7 @@ function saveToExcel(rows, meta) {
 module.exports = {
   buildSearchUrl,
   detectBlock,
+  detectCaptchaFramesOrWidgets,
   hasAvitoEmptySerpMessage,
   looksLikeAvitoSkeletonNoItems,
   parseListings,

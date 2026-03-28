@@ -9,14 +9,40 @@ const { parsePriceNumber } = require('./utils');
  * @typedef {Object} WbSearchParams
  * @property {string} query
  * @property {string} [extraKeywords]
+ * @property {string} [memory] — строка из консоли (например 128), для URL f4424
  * @property {number} minPrice
  * @property {number} maxPrice
  * @property {number} [page] — 1-based для пагинации в URL
  */
 
 /**
- * На WB в query часто передаётся priceU=min;max в «микроединицах» (копейки: руб × 100).
- * Если сайт проигнорирует параметр, фильтр по цене всё равно сработает в filterWbListings.
+ * Фильтр «встроенная память» в поиске WB: в URL добавляются `f4424=<id>` и `meta_charcs=true`.
+ * Пример (пользователь): 128 ГБ → f4424=25425.
+ * Другие объёмы: на wildberries.ru выберите фильтр памяти, скопируйте число после f4424 из адреса и добавьте строку в объект ниже.
+ */
+const WB_MEMORY_FACET_PARAM = 'f4424';
+const WB_MEMORY_GB_TO_F4424 = {
+  128: 25425,
+};
+
+/**
+ * @param {string} memoryRaw
+ * @returns {number|null} объём в ГБ для карты WB_MEMORY_GB_TO_F4424
+ */
+function parseWbMemoryGb(memoryRaw) {
+  const s = String(memoryRaw || '')
+    .trim()
+    .replace(/\s+/g, '')
+    .replace(/gb|гб/gi, '');
+  const digits = s.replace(/\D/g, '');
+  if (!digits) return null;
+  const n = parseInt(digits, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * На WB: priceU (копейки), sort=popular, page, при памяти — f4424 + meta_charcs=true.
+ * Если сайт проигнорирует часть параметров, filterWbListings всё равно подрежет по названию.
  * @param {WbSearchParams} p
  * @returns {string}
  */
@@ -24,9 +50,11 @@ function buildWbSearchUrl(p) {
   const extraRaw = (p.extraKeywords || '').trim();
   const fullQ = [String(p.query || '').trim(), extraRaw].filter(Boolean).join(' ').trim();
   const u = new URL('https://www.wildberries.ru/catalog/0/search.aspx');
+
+  const pageNum = Number.isFinite(p.page) && p.page >= 1 ? Math.floor(p.page) : 1;
+  u.searchParams.set('page', String(pageNum));
+  u.searchParams.set('sort', 'popular');
   u.searchParams.set('search', fullQ);
-  const page = Number.isFinite(p.page) && p.page > 1 ? Math.floor(p.page) : 0;
-  if (page > 1) u.searchParams.set('page', String(page));
 
   const minRub = Number.isFinite(p.minPrice) && p.minPrice > 0 ? Math.floor(p.minPrice) : 0;
   const maxRub = Number.isFinite(p.maxPrice) && p.maxPrice > 0 ? Math.floor(p.maxPrice) : 0;
@@ -34,6 +62,13 @@ function buildWbSearchUrl(p) {
     const minK = minRub > 0 ? minRub * 100 : 0;
     const maxK = maxRub > 0 ? maxRub * 100 : 999_999_999;
     u.searchParams.set('priceU', `${minK};${maxK}`);
+  }
+
+  const memGb = parseWbMemoryGb(p.memory || '');
+  if (memGb != null && memGb in WB_MEMORY_GB_TO_F4424) {
+    const v = WB_MEMORY_GB_TO_F4424[memGb];
+    u.searchParams.set(WB_MEMORY_FACET_PARAM, String(v));
+    u.searchParams.set('meta_charcs', 'true');
   }
 
   return u.href;
@@ -347,8 +382,16 @@ function buildWbSearchParamsExportRows(params) {
     extraKeywords: params.extraKeywords,
     minPrice: params.minPrice,
     maxPrice: params.maxPrice,
+    memory: params.memory,
     page: 1,
   });
+  const memGb = parseWbMemoryGb(params.memory || '');
+  const memInUrl =
+    memGb != null && memGb in WB_MEMORY_GB_TO_F4424
+      ? `${WB_MEMORY_FACET_PARAM}=${WB_MEMORY_GB_TO_F4424[memGb]}, meta_charcs=true`
+      : memGb != null
+        ? `нет в таблице id (добавьте ${memGb} ГБ в WB_MEMORY_GB_TO_F4424 в parser_wb.js по URL с сайта)`
+        : 'не задано';
   const rm = params.wbRatingMode || 'any';
   const ratingLabel =
     rm === 'with' ? 'Только с рейтингом на карточке' : rm === 'without' ? 'Только без рейтинга' : 'Не важно';
@@ -366,9 +409,10 @@ function buildWbSearchParamsExportRows(params) {
       Значение: Number.isFinite(params.maxPrice) && params.maxPrice > 0 ? String(params.maxPrice) : 'не задано',
     },
     {
-      Параметр: 'Память, ГБ (фильтр)',
+      Параметр: 'Память, ГБ (фильтр + в URL при известном id)',
       Значение: String(params.memory || '').trim() || 'любая',
     },
+    { Параметр: 'Память в строке запроса WB', Значение: memInUrl },
     {
       Параметр: 'Цвет (подстрока в названии)',
       Значение: String(params.color || '').trim() || 'любой',
@@ -379,6 +423,9 @@ function buildWbSearchParamsExportRows(params) {
 
 module.exports = {
   buildWbSearchUrl,
+  parseWbMemoryGb,
+  WB_MEMORY_FACET_PARAM,
+  WB_MEMORY_GB_TO_F4424,
   parseWbSerpPageIndexFromUrl,
   hasWbEmptySerpMessage,
   looksLikeWbSkeletonNoItems,
