@@ -5,6 +5,7 @@
  *   $env:AVITO_NO_PROXY=1   — без прокси (проверка, что падает именно прокси).
  *   $env:AVITO_MANUAL_PROXY=1 — см. main.js: сначала ручной вход на сайте провайдера, затем Enter.
  *   $env:AVITO_PROXY_ON_LAUNCH=1 — прокси на chromium.launch вместо newContext (если ERR_CONNECTION_CLOSED через контекст).
+ *   $env:WB_SKIP_HOME_WARMUP=1 — Wildberries: не заходить сначала на главную (wb_runner.js), только пауза и сразу URL поиска.
  */
 
 const { chromium } = require('playwright');

@@ -77,6 +77,9 @@ const WB_ITEM_SELECTOR =
  */
 const WB_NAV_SOFT_HTTP = new Set([408, 425, 498, 499, 500, 502, 503, 504]);
 
+/** Главная для «теплого» захода до URL поиска (меньше триггеров антибота, чем cold goto в каталог). */
+const WB_HOME_URL = 'https://www.wildberries.ru/';
+
 /**
  * @param {import('playwright').Page} page
  * @param {number} reportedStatus
@@ -89,7 +92,7 @@ async function waitForWbDomAfterSoftHttp(page, reportedStatus) {
     log(`  повторное ожидание load: ${String(e.message || e).slice(0, 96)}`);
   });
   await page.waitForLoadState('domcontentloaded', { timeout: 45_000 }).catch(() => {});
-  await randomDelay(6000, 12_000);
+  await randomDelay(12_000, 22_000);
   const n = await page.locator(WB_ITEM_SELECTOR).count().catch(() => 0);
   if (n === 0) {
     log('  карточек в DOM ещё нет — одна перезагрузка вкладки после мягкого HTTP…');
@@ -99,19 +102,29 @@ async function waitForWbDomAfterSoftHttp(page, reportedStatus) {
       log(`  reload после HTTP ${reportedStatus}: ${String(e.message || e).slice(0, 96)}`);
     }
     await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
-    await randomDelay(5000, 9000);
+    await randomDelay(8000, 14_000);
   }
 }
 
 const SOFT = {
-  beforeGotoMin: 600,
-  beforeGotoMax: 2200,
+  /** Перед любой навигацией WB — «остывание» после открытия вкладки. */
+  wbEntryPreambleMin: 2500,
+  wbEntryPreambleMax: 7000,
+  /** Если WB_SKIP_HOME_WARMUP=1 — только эти паузы перед прямым goto на выдачу. */
+  beforeGotoMin: 4000,
+  beforeGotoMax: 11_000,
+  /** После загрузки главной — дать сайту и скриптам «успокоиться». */
+  wbHomeSettleMin: 10_000,
+  wbHomeSettleMax: 22_000,
+  /** После активности на главной — перед переходом в поиск. */
+  wbBeforeSearchFromHomeMin: 5000,
+  wbBeforeSearchFromHomeMax: 14_000,
   /** После гейта выдачи — как «осмотр страницы» перед парсингом (сопоставимо с паузой Avito). */
-  afterListingGateMin: 6500,
-  afterListingGateMax: 13_000,
-  /** WB: дольше «остываем» после load перед проверкой капчи (жёсткая защита). */
-  wbSettleAfterLoadMin: 4500,
-  wbSettleAfterLoadMax: 10_000,
+  afterListingGateMin: 9000,
+  afterListingGateMax: 18_000,
+  /** WB: дольше «остываем» после load перед проверкой капчи. */
+  wbSettleAfterLoadMin: 12_000,
+  wbSettleAfterLoadMax: 24_000,
   warmupScrollsMin: 5,
   warmupScrollsMax: 8,
   warmupWheelMin: 70,
@@ -167,6 +180,26 @@ function isLikelyProxyOrTunnelDrop(err) {
     u.includes('ERR_TUNNEL_CONNECTION_FAILED') ||
     u.includes('ECONNRESET')
   );
+}
+
+/**
+ * До перехода на выдачу: неспешные движения мыши и короткий скролл (имитация осмотра главной).
+ * @param {import('playwright').Page} page
+ */
+async function wbWarmHumanPresence(page) {
+  const vp = page.viewportSize();
+  const w = Math.max(200, vp?.width ?? 1280);
+  const h = Math.max(200, vp?.height ?? 720);
+  for (let i = 0, n = randomInt(4, 8); i < n; i++) {
+    await page.mouse.move(randomInt(120, w - 120), randomInt(100, h - 100), {
+      steps: randomInt(18, 42),
+    });
+    await randomDelay(500, 1800);
+  }
+  for (let i = 0, n = randomInt(2, 5); i < n; i++) {
+    await page.mouse.wheel(0, randomInt(30, 110));
+    await randomDelay(800, 2400);
+  }
 }
 
 /**
@@ -519,15 +552,77 @@ async function runAttemptWb(params, opts = {}) {
   };
 
   try {
-    log('  сценарий WB: переход → гейт → парсинг → длинный скролл ленты (без пагинации)');
-    await randomDelay(SOFT.beforeGotoMin, SOFT.beforeGotoMax);
+    log('  сценарий WB: мягкий вход → гейт → парсинг → длинный скролл ленты (без пагинации)');
+    const skipHomeWarmup =
+      process.env.WB_SKIP_HOME_WARMUP === '1' || process.env.WB_SKIP_HOME_WARMUP === 'true';
+    if (skipHomeWarmup) {
+      log('  WB: WB_SKIP_HOME_WARMUP — без захода на главную, только пауза перед выдачей.');
+    }
+    await randomDelay(SOFT.wbEntryPreambleMin, SOFT.wbEntryPreambleMax);
+
+    if (!skipHomeWarmup) {
+      log('  WB: мягкий вход — сначала главная wildberries.ru, затем страница поиска…');
+      try {
+        /** @type {import('playwright').Response | null} */
+        let homeResp = null;
+        try {
+          homeResp = await page.goto(WB_HOME_URL, {
+            waitUntil: 'domcontentloaded',
+            timeout: NAV_TIMEOUT_MS,
+          });
+        } catch (homeErr) {
+          const hm = homeErr && homeErr.message ? homeErr.message : String(homeErr);
+          if (hm === 'IP_BLOCK') throw homeErr;
+          if (isLikelyProxyOrTunnelDrop(homeErr)) {
+            skipEnterBeforeClose = true;
+            rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+            throw new Error('IP_BLOCK');
+          }
+          log(`  WB: главная с задержкой (${hm.slice(0, 120)}) — ждём load в вкладке…`);
+          await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
+          await randomDelay(8000, 15_000);
+          homeResp = null;
+        }
+        if (homeResp) {
+          const stHome = homeResp.status();
+          if (stHome === 403 || stHome === 429) {
+            skipEnterBeforeClose = true;
+            rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+            throw new Error('IP_BLOCK');
+          }
+          if (WB_NAV_SOFT_HTTP.has(stHome)) {
+            await waitForWbDomAfterSoftHttp(page, stHome);
+          }
+        }
+      } catch (homeNavErr) {
+        const m = homeNavErr && homeNavErr.message ? homeNavErr.message : String(homeNavErr);
+        if (m === 'IP_BLOCK') throw homeNavErr;
+        if (isLikelyProxyOrTunnelDrop(homeNavErr)) {
+          skipEnterBeforeClose = true;
+          rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+          throw new Error('IP_BLOCK');
+        }
+        log(`  WB: главная не прошла (${m.slice(0, 140)}) — всё равно открываем URL поиска…`);
+        await randomDelay(6000, 12_000);
+      }
+      await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
+      await randomDelay(SOFT.wbHomeSettleMin, SOFT.wbHomeSettleMax);
+      await wbWarmHumanPresence(page);
+      await randomDelay(SOFT.wbBeforeSearchFromHomeMin, SOFT.wbBeforeSearchFromHomeMax);
+    } else {
+      await randomDelay(SOFT.beforeGotoMin, SOFT.beforeGotoMax);
+    }
+
     logStep(4, 'Адрес поиска Wildberries', openUrl);
 
     try {
       /** @type {import('playwright').Response | null} */
       let response = null;
       try {
-        response = await page.goto(openUrl, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
+        response = await page.goto(openUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: NAV_TIMEOUT_MS,
+        });
       } catch (gotoErr) {
         const gm = gotoErr && gotoErr.message ? gotoErr.message : String(gotoErr);
         if (gm === 'IP_BLOCK') throw gotoErr;
@@ -540,7 +635,7 @@ async function runAttemptWb(params, opts = {}) {
           `  WB: переход прервался (${gm.slice(0, 120)}) — ждём, пока страница догрузится в текущей вкладке…`
         );
         await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
-        await randomDelay(6000, 12_000);
+        await randomDelay(10_000, 20_000);
         response = null;
       }
 
