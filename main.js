@@ -163,9 +163,9 @@ const DEFAULT_IP_ROTATION_WAITS = 5;
 
 /**
  * Верхняя граница пауз ~2 мин при капче/IP на Wildberries за один запуск main.
- * Ниже по умолчанию не урезаем из‑за малого AVITO_IP_ROTATION_TRIES (на Avito может быть 1, на WB — до 5).
+ * Ниже по умолчанию не урезаем из‑за малого AVITO_IP_ROTATION_TRIES (на Avito может быть 1, на WB — до 10).
  */
-const WB_IP_ROTATION_MAX_WAITS = 5;
+const WB_IP_ROTATION_MAX_WAITS = 10;
 
 /**
  * Сколько раз после IP_BLOCK ждать ротацию прокси (120–130 с) и снова запускать браузер.
@@ -191,16 +191,17 @@ function effectiveIpRotationWaitLimit() {
 
 /**
  * Лимит пауз ~2 мин при IP_BLOCK на Wildberries.
- * Не опускаем ниже DEFAULT_IP_ROTATION_WAITS (5), если только не задано AVITO_IP_BLOCK_NO_WAIT с TRIES=0 —
- * иначе низкий AVITO_IP_ROTATION_TRIES давал бы в логе (1/1) вместо пяти попыток на WB.
+ * Не опускаем ниже WB_DEFAULT_IP_ROTATION_WAITS (10), если только не задано AVITO_IP_BLOCK_NO_WAIT с TRIES=0 —
+ * иначе низкий AVITO_IP_ROTATION_TRIES давал бы в логе (1/1) вместо десяти попыток на WB.
  */
 function effectiveWbIpRotationWaitLimit() {
+  const WB_DEFAULT_IP_ROTATION_WAITS = 10;
   const skip = process.env.AVITO_IP_BLOCK_NO_WAIT === '1' || process.env.AVITO_IP_BLOCK_NO_WAIT === 'true';
   const raw = maxIpRotationWaits();
   if (skip && raw === 0) return 0;
   if (skip) return Math.min(WB_IP_ROTATION_MAX_WAITS, raw);
   const avitoEff = effectiveIpRotationWaitLimit();
-  return Math.min(WB_IP_ROTATION_MAX_WAITS, Math.max(DEFAULT_IP_ROTATION_WAITS, avitoEff));
+  return Math.min(WB_IP_ROTATION_MAX_WAITS, Math.max(WB_DEFAULT_IP_ROTATION_WAITS, avitoEff));
 }
 
 /** Стартовая диагностика: прокси и лимит пауз ротации (чтобы не гадать, почему нет 2 мин ожидания). */

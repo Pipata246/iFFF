@@ -329,77 +329,29 @@ async function parseWbListings(page) {
  * @param {number} opts.limit
  */
 function filterWbListings(items, opts) {
-  const kw = String(opts.extraKeywords || '')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((k) => k.toLowerCase());
-  const mem = String(opts.memory || '').trim();
-  const memNorm = mem.replace(/\D/g, '');
+  // Важно: для WB модель/память/цена задаются URL'ом (query, priceU, f4424),
+  // поэтому на карточках их повторно НЕ фильтруем, чтобы не терять результаты.
   const colorRaw = String(opts.color || '').trim().toLowerCase();
 
   let out = items.slice();
 
-  // WB сам уже фильтруется URL'ом по query/extraKeywords, но на некоторых версиях вёрстки
-  // title извлекается неполно. Поэтому: применяем фильтр extraKeywords только если он не обнуляет список.
-  if (kw.length > 0) {
-    const before = out.slice();
-    const filteredByKw = out.filter((it) => {
-      const t = `${it.title || ''} ${it.filterText || ''}`.toLowerCase();
-      for (const k of kw) {
-        if (!t.includes(k)) return false;
-      }
-      return true;
-    });
-    if (filteredByKw.length > 0) out = filteredByKw;
-    // иначе оставляем out без применения keyword-фильтра
-    else out = before;
-  }
-
-  if (memNorm) {
-    const anyMemFound = out.some((it) => {
-      const t = `${it.title || ''} ${it.memoryLabel || ''} ${it.filterText || ''}`;
-      const re = new RegExp(`\\b${memNorm}\\s*(gb|гб|гиг|tb|тб)?\\b`, 'i');
-      return re.test(t) || t.includes(memNorm);
-    });
-
-    // Если WB вернул товары, а память распознана у 0 карточек (из-за смены вёрстки/селекторов),
-    // memory-фильтр сделает Excel пустым. Тогда лучше не фильтровать по памяти.
-    if (anyMemFound) {
-      const beforeMem = out.slice();
-      out = out.filter((it) => {
-        const t = `${it.title || ''} ${it.memoryLabel || ''} ${it.filterText || ''}`;
-        const re = new RegExp(`\\b${memNorm}\\s*(gb|гб|гиг|tb|тб)?\\b`, 'i');
-        return re.test(t) || t.includes(memNorm);
-      });
-      // Доп. защита: если из-за несовпадения формата памяти всё срезалось в 0 — не делаем пустой Excel.
-      if (out.length === 0) out = beforeMem;
-    }
-  }
-
   if (colorRaw) {
-    const before = out.slice();
-    const filteredByColor = out.filter((it) =>
-      `${it.title || ''} ${it.filterText || ''}`.toLowerCase().includes(colorRaw)
-    );
-    // Аналогично keywords: если из-за извлечения/вёрстки цвет не распознался корректно — не делаем пустой Excel.
-    if (filteredByColor.length > 0) out = filteredByColor;
-    else out = before;
+    out = out.filter((it) => `${it.title || ''} ${it.filterText || ''}`.toLowerCase().includes(colorRaw));
   }
-
-  out = out.filter((it) => {
-    const n = it.priceNum;
-    if (n == null) return true;
-    if (Number.isFinite(opts.minPrice) && opts.minPrice > 0 && n < opts.minPrice) return false;
-    if (Number.isFinite(opts.maxPrice) && opts.maxPrice > 0 && n > opts.maxPrice) return false;
-    return true;
-  });
 
   const mode = opts.ratingMode || 'any';
   if (mode === 'with') {
-    out = out.filter((it) => it.rating != null && Number.isFinite(it.rating));
+    out = out.filter(
+      (it) =>
+        (it.rating != null && Number.isFinite(it.rating)) ||
+        (it.reviewsCount != null && Number.isFinite(it.reviewsCount) && it.reviewsCount > 0)
+    );
   } else if (mode === 'without') {
-    out = out.filter((it) => it.rating == null || !Number.isFinite(it.rating));
+    out = out.filter(
+      (it) =>
+        (it.rating == null || !Number.isFinite(it.rating)) &&
+        (it.reviewsCount == null || !Number.isFinite(it.reviewsCount) || it.reviewsCount <= 0)
+    );
   }
 
   if (opts.limit > 0) out = out.slice(0, opts.limit);
@@ -412,11 +364,12 @@ function filterWbListings(items, opts) {
  */
 function wbListingsFilterOpts(params) {
   return {
-    extraKeywords: params.extraKeywords || '',
-    memory: params.memory || '',
+    // На WB эти параметры применяются URL'ом, а не постфильтром по карточкам.
+    extraKeywords: '',
+    memory: '',
     color: params.color || '',
-    minPrice: params.minPrice,
-    maxPrice: params.maxPrice,
+    minPrice: 0,
+    maxPrice: 0,
     ratingMode: params.wbRatingMode || 'any',
     limit: 0,
   };

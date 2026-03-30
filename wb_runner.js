@@ -38,35 +38,13 @@ function isWbSearchUrl(urlStr) {
 }
 
 /**
- * @param {{ domGateCtx: { page: import('playwright').Page | null }, crawlState: { serpPageIndex: number }, openUrl: string }} ctx
+ * При IP_BLOCK/капче на WB начинаем следующую попытку "с нуля":
+ * без возобновления текущей вкладки/URL (полный перезапуск сценария WB в рамках того же процесса).
  */
-function rememberWbListingForIpRetry(ctx) {
-  const { domGateCtx, crawlState, openUrl } = ctx;
-  let url = openUrl;
-  try {
-    const p = domGateCtx.page;
-    if (p && typeof p.url === 'function') {
-      const u = p.url();
-      if (
-        u &&
-        !/^(chrome-error|about:|chrome:\/\/)/i.test(u) &&
-        isWbSearchUrl(u)
-      ) {
-        url = u;
-      }
-    }
-  } catch (_) {
-    /* keep openUrl */
-  }
-  if (!isWbSearchUrl(url)) {
-    url = openUrl;
-  }
-  resumeListingUrlWb = normalizeWbSearchUrlSingleFeed(url);
-  resumeSerpPageIndexWb = 1;
-  log(
-    `  WB: капча / IP-блок — сохранена позиция выдачи (стр. ${resumeSerpPageIndexWb}); закроем браузер и повторим после ротации мобильного прокси.`
-  );
-  log(`  ${resumeListingUrlWb}`);
+function resetWbProgressForFreshRestart() {
+  resumeListingUrlWb = null;
+  resumeSerpPageIndexWb = null;
+  log('  WB: капча / IP-блок — следующая попытка будет полным рестартом (без resume URL).');
 }
 
 const NAV_TIMEOUT_MS = 180_000;
@@ -714,7 +692,7 @@ async function runAttemptWb(params, opts = {}) {
   const ipHooks = {
     onIpBlock() {
       skipEnterBeforeClose = true;
-      rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+      resetWbProgressForFreshRestart();
       throw new Error('IP_BLOCK');
     },
   };
@@ -765,7 +743,7 @@ async function runAttemptWb(params, opts = {}) {
           if (hm === 'IP_BLOCK') throw homeErr;
           if (isLikelyProxyOrTunnelDrop(homeErr)) {
             skipEnterBeforeClose = true;
-            rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+            resetWbProgressForFreshRestart();
             throw new Error('IP_BLOCK');
           }
           log(`  WB: главная с задержкой (${hm.slice(0, 120)}) — ждём load в вкладке…`);
@@ -777,7 +755,7 @@ async function runAttemptWb(params, opts = {}) {
           const stHome = homeResp.status();
           if (stHome === 403 || stHome === 429) {
             skipEnterBeforeClose = true;
-            rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+            resetWbProgressForFreshRestart();
             throw new Error('IP_BLOCK');
           }
           if (WB_NAV_SOFT_HTTP.has(stHome)) {
@@ -789,7 +767,7 @@ async function runAttemptWb(params, opts = {}) {
         if (m === 'IP_BLOCK') throw homeNavErr;
         if (isLikelyProxyOrTunnelDrop(homeNavErr)) {
           skipEnterBeforeClose = true;
-          rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+          resetWbProgressForFreshRestart();
           throw new Error('IP_BLOCK');
         }
         log(`  WB: главная не прошла (${m.slice(0, 140)}) — всё равно открываем URL поиска…`);
@@ -808,7 +786,7 @@ async function runAttemptWb(params, opts = {}) {
         if (!cleared) {
           logBlock('WB: блок сохранился — закрываем браузер и ждём ротацию IP');
           skipEnterBeforeClose = true;
-          rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+          resetWbProgressForFreshRestart();
           throw new Error('IP_BLOCK');
         }
         log('  WB: блок/проверка ушла сама — продолжаем мягкий вход.');
@@ -836,7 +814,7 @@ async function runAttemptWb(params, opts = {}) {
         if (gm === 'IP_BLOCK') throw gotoErr;
         if (isLikelyProxyOrTunnelDrop(gotoErr)) {
           skipEnterBeforeClose = true;
-          rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+          resetWbProgressForFreshRestart();
           throw new Error('IP_BLOCK');
         }
         log(
@@ -851,7 +829,7 @@ async function runAttemptWb(params, opts = {}) {
         const st = response.status();
         if (st === 403 || st === 429) {
           skipEnterBeforeClose = true;
-          rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+          resetWbProgressForFreshRestart();
           throw new Error('IP_BLOCK');
         }
         if (WB_NAV_SOFT_HTTP.has(st)) {
@@ -867,7 +845,7 @@ async function runAttemptWb(params, opts = {}) {
       if (/^WB: HTTP \d+/i.test(m)) throw navErr;
       if (isLikelyProxyOrTunnelDrop(navErr)) {
         skipEnterBeforeClose = true;
-        rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+        resetWbProgressForFreshRestart();
         throw new Error('IP_BLOCK');
       }
       throw navErr;
@@ -901,17 +879,6 @@ async function runAttemptWb(params, opts = {}) {
     raw.push(...batch);
     raw = dedupeByHref(raw);
     log(`  WB после полного скролла ленты, уникальных: ${raw.length}`);
-
-    log('  финальный проход: снова вверх и укороченный скролл ленты для догрузки…');
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await randomDelay(2000, 4000);
-    await gentleWarmupScroll(page);
-    await humanBehavior(page);
-    await scrollWbFeedUntilStable(page, { maxIter: 70, stableRounds: 3 });
-    batch = await parseWbListings(page);
-    raw.push(...batch);
-    raw = dedupeByHref(raw);
-    log(`  WB после финального прохода, уникальных: ${raw.length}`);
 
     await saveWbCheckpoint(
       raw,
