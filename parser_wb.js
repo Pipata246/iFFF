@@ -10,6 +10,7 @@ const { parsePriceNumber } = require('./utils');
  * @property {string} query
  * @property {string} [extraKeywords]
  * @property {string} [memory] — строка из консоли (например 128), для URL f4424
+ * @property {string} [color] — строка цвета из консоли (например "Синий"), для URL f14177449
  * @property {number} minPrice
  * @property {number} maxPrice
  * @property {number} [page] — 1-based для пагинации в URL
@@ -26,6 +27,42 @@ const WB_MEMORY_GB_TO_F4424 = {
   256: 25425,
   512: 117419,
   1024: 231154,
+};
+
+/** Цвет в URL WB (facet id из строки поиска). */
+const WB_COLOR_FACET_PARAM = 'f14177449';
+const WB_COLOR_TO_F14177449 = {
+  бежевый: 20214644,
+  beige: 20214644,
+  белый: 12065905,
+  white: 12065905,
+  голубой: 20214449,
+  lightblue: 20214449,
+  'светло-синий': 20214449,
+  желтый: 14185777,
+  жёлтый: 14185777,
+  yellow: 14185777,
+  зеленый: 14835931,
+  зелёный: 14835931,
+  green: 14835931,
+  коричневый: 20214658,
+  brown: 20214658,
+  красный: 11807341,
+  red: 11807341,
+  оранжевый: 20214770,
+  orange: 20214770,
+  розовый: 11807342,
+  pink: 11807342,
+  серый: 20214430,
+  grey: 20214430,
+  gray: 20214430,
+  синий: 20214646,
+  blue: 20214646,
+  фиолетовый: 14185662,
+  purple: 14185662,
+  черный: 13600062,
+  чёрный: 13600062,
+  black: 13600062,
 };
 
 /**
@@ -68,9 +105,19 @@ function buildWbSearchUrl(p) {
   }
 
   const memGb = parseWbMemoryGb(p.memory || '');
+  let hasMetaCharsFacet = false;
   if (memGb != null && memGb in WB_MEMORY_GB_TO_F4424) {
     const v = WB_MEMORY_GB_TO_F4424[memGb];
     u.searchParams.set(WB_MEMORY_FACET_PARAM, String(v));
+    hasMetaCharsFacet = true;
+  }
+
+  const colorRaw = String(p.color || '').trim().toLowerCase();
+  if (colorRaw && colorRaw in WB_COLOR_TO_F14177449) {
+    u.searchParams.set(WB_COLOR_FACET_PARAM, String(WB_COLOR_TO_F14177449[colorRaw]));
+    hasMetaCharsFacet = true;
+  }
+  if (hasMetaCharsFacet) {
     u.searchParams.set('meta_charcs', 'true');
   }
 
@@ -237,25 +284,6 @@ async function parseWbListings(page) {
       return lines.join(' ');
     }
 
-    function parseRatingBlock(text) {
-      const raw = (text || '').replace(/\s+/g, ' ');
-      const m = raw.match(/(\d+[.,]\d+)\s*[·•]\s*(\d+)\s*оцен/i);
-      if (m) {
-        const r = parseFloat(m[1].replace(',', '.'));
-        const c = parseInt(m[2], 10);
-        return {
-          rating: Number.isFinite(r) && r >= 0 && r <= 5 ? r : null,
-          reviews: Number.isFinite(c) ? c : null,
-        };
-      }
-      const m2 = raw.match(/(\d+[.,]\d+)/);
-      if (m2) {
-        const r = parseFloat(m2[1].replace(',', '.'));
-        return { rating: Number.isFinite(r) && r >= 0 && r <= 5 ? r : null, reviews: null };
-      }
-      return { rating: null, reviews: null };
-    }
-
     function pickBrand(root, title) {
       const el = root.querySelector('[class*="brand"]');
       const b = el?.textContent?.trim();
@@ -287,7 +315,6 @@ async function parseWbListings(page) {
       const blockText = (root.textContent || '').replace(/\s+/g, ' ');
       // На WB память может встречаться не только в title/specs, поэтому ищем по всему тексту карточки.
       const memoryLabel = pickMemoryFromText(`${title} ${specs} ${blockText}`);
-      const { rating, reviews } = parseRatingBlock(blockText);
       const brand = pickBrand(root, title);
       const colorHint = '';
 
@@ -300,8 +327,9 @@ async function parseWbListings(page) {
         sellerName: brand || 'Wildberries',
         publishedLabel: '—',
         sellerKind: 'company',
-        rating,
-        reviewsCount: reviews,
+        // На WB рейтинг отключён: не парсим и не фильтруем.
+        rating: null,
+        reviewsCount: null,
         colorHint,
         // Для устойчивых фильтров (title на WB иногда извлекается неполностью).
         filterText: blockText,
@@ -329,30 +357,11 @@ async function parseWbListings(page) {
  * @param {number} opts.limit
  */
 function filterWbListings(items, opts) {
-  // Важно: для WB модель/память/цена задаются URL'ом (query, priceU, f4424),
+  // Важно: для WB модель/память/цена/цвет задаются URL'ом (search, priceU, f4424, f14177449),
   // поэтому на карточках их повторно НЕ фильтруем, чтобы не терять результаты.
-  const colorRaw = String(opts.color || '').trim().toLowerCase();
+  // Рейтинг на WB также отключён (не фильтруем).
 
   let out = items.slice();
-
-  if (colorRaw) {
-    out = out.filter((it) => `${it.title || ''} ${it.filterText || ''}`.toLowerCase().includes(colorRaw));
-  }
-
-  const mode = opts.ratingMode || 'any';
-  if (mode === 'with') {
-    out = out.filter(
-      (it) =>
-        (it.rating != null && Number.isFinite(it.rating)) ||
-        (it.reviewsCount != null && Number.isFinite(it.reviewsCount) && it.reviewsCount > 0)
-    );
-  } else if (mode === 'without') {
-    out = out.filter(
-      (it) =>
-        (it.rating == null || !Number.isFinite(it.rating)) &&
-        (it.reviewsCount == null || !Number.isFinite(it.reviewsCount) || it.reviewsCount <= 0)
-    );
-  }
 
   if (opts.limit > 0) out = out.slice(0, opts.limit);
   return out;
@@ -367,10 +376,10 @@ function wbListingsFilterOpts(params) {
     // На WB эти параметры применяются URL'ом, а не постфильтром по карточкам.
     extraKeywords: '',
     memory: '',
-    color: params.color || '',
+    color: '',
     minPrice: 0,
     maxPrice: 0,
-    ratingMode: params.wbRatingMode || 'any',
+    ratingMode: 'any',
     limit: 0,
   };
 }
@@ -386,6 +395,7 @@ function buildWbSearchParamsExportRows(params) {
     minPrice: params.minPrice,
     maxPrice: params.maxPrice,
     memory: params.memory,
+    color: params.color,
     page: 1,
   });
   const memGb = parseWbMemoryGb(params.memory || '');
@@ -395,9 +405,13 @@ function buildWbSearchParamsExportRows(params) {
       : memGb != null
         ? `нет в таблице id (добавьте ${memGb} ГБ в WB_MEMORY_GB_TO_F4424 в parser_wb.js по URL с сайта)`
         : 'не задано';
-  const rm = params.wbRatingMode || 'any';
-  const ratingLabel =
-    rm === 'with' ? 'Только с рейтингом на карточке' : rm === 'without' ? 'Только без рейтинга' : 'Не важно';
+  const colorRaw = String(params.color || '').trim().toLowerCase();
+  const colorInUrl =
+    colorRaw && colorRaw in WB_COLOR_TO_F14177449
+      ? `${WB_COLOR_FACET_PARAM}=${WB_COLOR_TO_F14177449[colorRaw]}, meta_charcs=true`
+      : colorRaw
+        ? `нет в таблице id (добавьте "${params.color}" в WB_COLOR_TO_F14177449 в parser_wb.js по URL с сайта)`
+        : 'не задано';
   return [
     { Параметр: 'Площадка', Значение: 'Wildberries' },
     { Параметр: 'URL поиска (как открывал парсер)', Значение: u },
@@ -417,10 +431,10 @@ function buildWbSearchParamsExportRows(params) {
     },
     { Параметр: 'Память в строке запроса WB', Значение: memInUrl },
     {
-      Параметр: 'Цвет (подстрока в названии)',
+      Параметр: 'Цвет (фильтр WB в URL при известном id)',
       Значение: String(params.color || '').trim() || 'любой',
     },
-    { Параметр: 'Рейтинг на карточке', Значение: ratingLabel },
+    { Параметр: 'Цвет в строке запроса WB', Значение: colorInUrl },
   ];
 }
 
@@ -429,6 +443,8 @@ module.exports = {
   parseWbMemoryGb,
   WB_MEMORY_FACET_PARAM,
   WB_MEMORY_GB_TO_F4424,
+  WB_COLOR_FACET_PARAM,
+  WB_COLOR_TO_F14177449,
   normalizeWbSearchUrlSingleFeed,
   parseWbSerpPageIndexFromUrl,
   hasWbEmptySerpMessage,

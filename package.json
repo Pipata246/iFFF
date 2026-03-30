@@ -5,12 +5,14 @@
   "main": "main.js",
   "scripts": {
     "start": "node main.js",
+    "bot": "node telegram_bot.js",
     "postinstall": "playwright install chromium"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
+    "node-telegram-bot-api": "^0.67.0",
     "playwright": "^1.49.0",
     "xlsx": "^0.18.5"
   }

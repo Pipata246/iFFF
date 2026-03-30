@@ -159,7 +159,7 @@ async function saveListingsCheckpoint(raw, params, checkpointLabel) {
 }
 
 /** Сколько пауз ротации после IP_BLOCK/капчи по умолчанию (если AVITO_IP_ROTATION_TRIES не задан). */
-const DEFAULT_IP_ROTATION_WAITS = 5;
+const DEFAULT_IP_ROTATION_WAITS = 10;
 
 /**
  * Верхняя граница пауз ~2 мин при капче/IP на Wildberries за один запуск main.
@@ -647,7 +647,7 @@ function ask(rl, q) {
 }
 
 /**
- * @returns {Promise<import('./parser').SearchParams & { memory: string, minRating: number, onlyToday: boolean, marketplace: 'avito'|'wb'|'both', color: string, wbRatingMode: 'any'|'with'|'without' }>}
+ * @returns {Promise<import('./parser').SearchParams & { memory: string, minRating: number, onlyToday: boolean, marketplace: 'avito'|'wb'|'both', color: string }>}
  */
 async function collectParams() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -699,17 +699,8 @@ async function collectParams() {
     }
 
     let color = '';
-    /** @type {'any'|'with'|'without'} */
-    let wbRatingMode = 'any';
     if (marketplace === 'wb' || marketplace === 'both') {
       color = await ask(rl, 'Wildberries — цвет в названии (подстрока, пусто = любой): ');
-      const wr = await ask(
-        rl,
-        'Wildberries — оценки на карточке: 1 — не важно, 2 — только с рейтингом, 3 — только без рейтинга: '
-      );
-      const w = (wr || '').trim().toLowerCase();
-      if (w === '2' || /только\s*с|с\s*рейтинг|есть\s*оцен/i.test(w)) wbRatingMode = 'with';
-      else if (w === '3' || /без\s*рейтинг|нет\s*рейтинг|без\s*оцен/i.test(w)) wbRatingMode = 'without';
     }
 
     const minPrice = parseInt(minPriceStr, 10) || 0;
@@ -727,7 +718,6 @@ async function collectParams() {
       minRating,
       onlyToday,
       color,
-      wbRatingMode,
     };
   } finally {
     rl.close();
@@ -1107,7 +1097,8 @@ async function runAttempt(params) {
  * @param {{
  *   ipWaitLimit?: number,
  *   nonIpRetryDelayMinMs?: number,
- *   nonIpRetryDelayMaxMs?: number
+ *   nonIpRetryDelayMaxMs?: number,
+ *   maxRunAttempts?: number
  * }} [options] — лимит пауз ~2 мин при IP_BLOCK + паузы при прочих сбоях
  * @returns {Promise<T>}
  */
@@ -1129,7 +1120,10 @@ async function runIpRetryLoop(label, fn, options = {}) {
     options != null && options.nonIpRetryDelayMaxMs != null && Number.isFinite(options.nonIpRetryDelayMaxMs)
       ? Math.max(nonIpRetryDelayMinMs, Math.floor(options.nonIpRetryDelayMaxMs))
       : 6000;
-  const maxRunAttempts = Math.max(MAX_RUN_ATTEMPTS_MIN, ipWaitLimit + 10);
+  const maxRunAttempts =
+    options != null && options.maxRunAttempts != null && Number.isFinite(options.maxRunAttempts)
+      ? Math.max(1, Math.floor(options.maxRunAttempts))
+      : Math.max(MAX_RUN_ATTEMPTS_MIN, ipWaitLimit + 10);
 
   for (let attempt = 1; attempt <= maxRunAttempts; attempt++) {
     try {
@@ -1217,6 +1211,7 @@ async function main() {
         }),
       {
         ipWaitLimit: effectiveWbIpRotationWaitLimit(),
+        maxRunAttempts: effectiveWbIpRotationWaitLimit(),
         // При WB чаще бывают "не успело прогрузиться DOM / оверлей / не тот стейт",
         // поэтому между не-IP повторами делаем паузы больше, чтобы не долбить сайт.
         nonIpRetryDelayMinMs: 8000,
