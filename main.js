@@ -1103,7 +1103,11 @@ async function runAttempt(params) {
  * @template T
  * @param {string} label
  * @param {() => Promise<T>} fn
- * @param {{ ipWaitLimit?: number }} [options] — лимит пауз ~2 мин при IP_BLOCK (по умолчанию effectiveIpRotationWaitLimit())
+ * @param {{
+ *   ipWaitLimit?: number,
+ *   nonIpRetryDelayMinMs?: number,
+ *   nonIpRetryDelayMaxMs?: number
+ * }} [options] — лимит пауз ~2 мин при IP_BLOCK + паузы при прочих сбоях
  * @returns {Promise<T>}
  */
 async function runIpRetryLoop(label, fn, options = {}) {
@@ -1116,6 +1120,14 @@ async function runIpRetryLoop(label, fn, options = {}) {
     options != null && options.ipWaitLimit != null && Number.isFinite(options.ipWaitLimit)
       ? Math.max(0, Math.floor(options.ipWaitLimit))
       : effectiveIpRotationWaitLimit();
+  const nonIpRetryDelayMinMs =
+    options != null && options.nonIpRetryDelayMinMs != null && Number.isFinite(options.nonIpRetryDelayMinMs)
+      ? Math.max(0, Math.floor(options.nonIpRetryDelayMinMs))
+      : 3000;
+  const nonIpRetryDelayMaxMs =
+    options != null && options.nonIpRetryDelayMaxMs != null && Number.isFinite(options.nonIpRetryDelayMaxMs)
+      ? Math.max(nonIpRetryDelayMinMs, Math.floor(options.nonIpRetryDelayMaxMs))
+      : 6000;
   const maxRunAttempts = Math.max(MAX_RUN_ATTEMPTS_MIN, ipWaitLimit + 10);
 
   for (let attempt = 1; attempt <= maxRunAttempts; attempt++) {
@@ -1147,7 +1159,7 @@ async function runIpRetryLoop(label, fn, options = {}) {
       }
 
       logRetry(`${label}: ${msg} (пауза перед следующей попыткой)`);
-      await randomDelay(3000, 6000);
+      await randomDelay(nonIpRetryDelayMinMs, nonIpRetryDelayMaxMs);
     }
   }
 
@@ -1202,7 +1214,13 @@ async function main() {
           priorExcelRows: priorForWb,
           filterExportRows: sessionFilterExportRows,
         }),
-      { ipWaitLimit: effectiveWbIpRotationWaitLimit() }
+      {
+        ipWaitLimit: effectiveWbIpRotationWaitLimit(),
+        // При WB чаще бывают "не успело прогрузиться DOM / оверлей / не тот стейт",
+        // поэтому между не-IP повторами делаем паузы больше, чтобы не долбить сайт.
+        nonIpRetryDelayMinMs: 8000,
+        nonIpRetryDelayMaxMs: 16000,
+      }
     );
   }
 }

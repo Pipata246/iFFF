@@ -94,6 +94,56 @@ const WB_NAV_SOFT_HTTP = new Set([408, 425, 498, 499, 500, 502, 503, 504]);
 const WB_HOME_URL = 'https://www.wildberries.ru/';
 
 /**
+ * Более точная проверка "блок/капча" именно для WB, чтобы не ловить ложные срабатывания
+ * от баннеров/куки/маркетинговых оверлеев.
+ * @param {import('playwright').Page} page
+ * @returns {Promise<boolean>}
+ */
+async function detectWbBlock(page) {
+  const hasCaptchaFrame = await page
+    .evaluate(() => {
+      const iframes = Array.from(document.querySelectorAll('iframe'));
+      for (const f of iframes) {
+        const s = (f.getAttribute('src') || '').toLowerCase();
+        if (
+          s.includes('hcaptcha') ||
+          s.includes('recaptcha') ||
+          s.includes('captcha') ||
+          s.includes('turnstile') ||
+          s.includes('challenges.cloudflare') ||
+          s.includes('/captcha/')
+        ) {
+          return true;
+        }
+      }
+      return false;
+    })
+    .catch(() => false);
+  if (hasCaptchaFrame) return true;
+
+  const body = await page.locator('body').innerText().catch(() => '');
+  const low = String(body || '').toLowerCase();
+
+  const hasHardCaptcha =
+    /капча|captcha|hcaptcha|recaptcha|turnstile/i.test(low) ||
+    /робот|не\s*робот|подтвердите\s+что\s+вы\s+человек|докажите\s+что\s+вы\s+не\s+робот/i.test(low);
+
+  const hasIpBlock =
+    /доступ\s+ограничен|доступ\s+временно\s+ограничен|слишком\s+много\s+запросов|ограничен\s+по\s+ip|с\s+вашего\s+ip|request blocked|attention required|just a moment/i.test(
+      low
+    );
+
+  const hasBrowserCheck = /провер(я|ке|яем)\s+браузер|checking your browser|проверяем\s+ваш\s+браузер|проверка\s+браузера/i.test(
+    low
+  );
+
+  // "Проверка браузера" без явных слов про капчу/робота — не считаем блоком.
+  if (hasBrowserCheck && !hasHardCaptcha) return false;
+
+  return hasHardCaptcha || hasIpBlock;
+}
+
+/**
  * @param {import('playwright').Page} page
  * @param {number} reportedStatus
  */
@@ -196,15 +246,16 @@ async function wbWarmHumanPresence(page) {
   const vp = page.viewportSize();
   const w = Math.max(200, vp?.width ?? 1280);
   const h = Math.max(200, vp?.height ?? 720);
-  for (let i = 0, n = randomInt(4, 8); i < n; i++) {
+  // Меньше движений на старте = меньше триггеров антибота.
+  for (let i = 0, n = randomInt(2, 4); i < n; i++) {
     await page.mouse.move(randomInt(120, w - 120), randomInt(100, h - 100), {
       steps: randomInt(18, 42),
     });
-    await randomDelay(500, 1800);
+    await randomDelay(600, 1600);
   }
-  for (let i = 0, n = randomInt(2, 5); i < n; i++) {
-    await page.mouse.wheel(0, randomInt(30, 110));
-    await randomDelay(800, 2400);
+  for (let i = 0, n = randomInt(1, 3); i < n; i++) {
+    await page.mouse.wheel(0, randomInt(20, 80));
+    await randomDelay(900, 2000);
   }
 }
 
@@ -248,6 +299,22 @@ async function dismissWbOverlays(page) {
 }
 
 /**
+ * На WB блок/капча иногда появляется "шумом" и уходит через время.
+ * Чтобы не делать лишние ротации IP, ждём 15–25 секунд и проверяем снова.
+ * @param {import('playwright').Page} page
+ * @param {number} timeoutMs
+ * @returns {Promise<boolean>} true — блок ушёл, false — сохранился
+ */
+async function waitForWbBlockToClear(page, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await detectWbBlock(page))) return true;
+    await randomDelay(5000, 9000);
+  }
+  return !(await detectWbBlock(page));
+}
+
+/**
  * @param {import('playwright').Page} page
  * @param {string} pageLabel
  * @param {{ onIpBlock: () => never }} hooks
@@ -286,9 +353,16 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
   } else {
     log(`  [${pageLabel}] WB: проверка капчи / антибота…`);
   }
-  if (await detectBlock(page)) {
-    logBlock(`[${pageLabel}] Wildberries — капча или экран ограничения; закрываем браузер и ждём новый IP`);
-    hooks.onIpBlock();
+  if (await detectWbBlock(page)) {
+    logBlock(
+      `[${pageLabel}] Wildberries — капча/проверка браузера обнаружена; ждём 20–25 сек и проверяем ещё раз`
+    );
+    const cleared = await waitForWbBlockToClear(page, 25_000);
+    if (!cleared) {
+      logBlock(`[${pageLabel}] Wildberries — блок сохранился; закрываем браузер и ждём новый IP`);
+      hooks.onIpBlock();
+    }
+    log(`  [${pageLabel}] блок ушёл сам — продолжаем без IP-ротации.`);
   }
   if (isFirstPage) {
     logStep(7, 'Ограничений в тексте и виджетах не видно (WB)', 'продолжаем');
@@ -337,9 +411,16 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
       }
       await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
       await randomDelay(SOFT.wbSettleAfterLoadMin, SOFT.wbSettleAfterLoadMax);
-      if (await detectBlock(page)) {
-        logBlock(`[${pageLabel}] после перезагрузки WB — капча / блок`);
-        hooks.onIpBlock();
+      if (await detectWbBlock(page)) {
+        logBlock(
+          `[${pageLabel}] после перезагрузки WB — капча/проверка; ждём 15–20 сек и проверяем ещё раз`
+        );
+        const cleared = await waitForWbBlockToClear(page, 20_000);
+        if (!cleared) {
+          logBlock(`[${pageLabel}] блок сохранился после ожидания — ротация IP`);
+          hooks.onIpBlock();
+        }
+        log(`  [${pageLabel}] блок/проверка ушли — продолжаем.`);
       }
     }
 
@@ -349,9 +430,16 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
       gotCards = true;
       break;
     } catch {
-      if (await detectBlock(page)) {
-        logBlock(`[${pageLabel}] карточек нет — при проверке видна капча / блок WB`);
-        hooks.onIpBlock();
+      if (await detectWbBlock(page)) {
+        logBlock(
+          `[${pageLabel}] карточек нет — при проверке видна капча/проверка; ждём 15–20 сек и проверяем ещё раз`
+        );
+        const cleared = await waitForWbBlockToClear(page, 20_000);
+        if (!cleared) {
+          logBlock(`[${pageLabel}] блок сохранился — ротация IP`);
+          hooks.onIpBlock();
+        }
+        log(`  [${pageLabel}] блок/проверка ушли — продолжаем ожидание карточек.`);
       }
       if (await hasWbEmptySerpMessage(page)) {
         throw new Error('Wildberries: пустая выдача по запросу.');
@@ -604,14 +692,16 @@ async function runAttemptWb(params, opts = {}) {
 
   try {
     log('  сценарий WB: мягкий вход → гейт → парсинг → длинный скролл ленты (без пагинации)');
-    const skipHomeWarmup =
-      process.env.WB_SKIP_HOME_WARMUP === '1' || process.env.WB_SKIP_HOME_WARMUP === 'true';
-    if (skipHomeWarmup) {
-      log('  WB: WB_SKIP_HOME_WARMUP — без захода на главную, только пауза перед выдачей.');
+    // По умолчанию не ходим на главную WB: там чаще всего всплывают оверлеи/проверки,
+    // из-за которых мы теряем попытки до открытия URL поиска.
+    // Включить заход на главную можно флагом: WB_USE_HOME_WARMUP=1
+    const useHomeWarmup = process.env.WB_USE_HOME_WARMUP === '1' || process.env.WB_USE_HOME_WARMUP === 'true';
+    if (!useHomeWarmup) {
+      log('  WB: без захода на главную (WB_USE_HOME_WARMUP=0) — сразу подготовка и URL поиска');
     }
     await randomDelay(SOFT.wbEntryPreambleMin, SOFT.wbEntryPreambleMax);
 
-    if (!skipHomeWarmup) {
+    if (useHomeWarmup) {
       log('  WB: мягкий вход — сначала главная wildberries.ru, затем страница поиска…');
       try {
         /** @type {import('playwright').Response | null} */
@@ -661,16 +751,25 @@ async function runAttemptWb(params, opts = {}) {
       // Перед любыми "активностями" мышью/скроллом проверяем, не запустилась ли
       // "проверка браузера" / капча. Если она есть — НЕ трогаем страницу,
       // закрываем браузер и уходим на IP-ротацию.
-      if (await detectBlock(page)) {
-        logBlock('WB: на главной обнаружена капча/проверка браузера — закрываем браузер и ждём ротацию IP');
-        skipEnterBeforeClose = true;
-        rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
-        throw new Error('IP_BLOCK');
+      if (await detectWbBlock(page)) {
+        logBlock(
+          'WB: на главной обнаружена капча/проверка браузера — подождём 25–30 сек и проверим ещё раз'
+        );
+        const cleared = await waitForWbBlockToClear(page, 30_000);
+        if (!cleared) {
+          logBlock('WB: блок сохранился — закрываем браузер и ждём ротацию IP');
+          skipEnterBeforeClose = true;
+          rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+          throw new Error('IP_BLOCK');
+        }
+        log('  WB: блок/проверка ушла сама — продолжаем мягкий вход.');
       }
       await wbWarmHumanPresence(page);
       await randomDelay(SOFT.wbBeforeSearchFromHomeMin, SOFT.wbBeforeSearchFromHomeMax);
     } else {
       await randomDelay(SOFT.beforeGotoMin, SOFT.beforeGotoMax);
+      // Мягкая имитация "пользователь открыл страницу и посмотрел" до перехода на URL поиска.
+      await wbWarmHumanPresence(page);
     }
 
     logStep(4, 'Адрес поиска Wildberries', openUrl);
