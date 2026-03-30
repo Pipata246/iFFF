@@ -284,8 +284,9 @@ async function parseWbListings(page) {
       const title = pickTitle(root, mainA);
       const priceText = pickPrice(root);
       const specs = pickSpecsBlock(root);
-      const memoryLabel = pickMemoryFromText(`${title} ${specs}`);
       const blockText = (root.textContent || '').replace(/\s+/g, ' ');
+      // На WB память может встречаться не только в title/specs, поэтому ищем по всему тексту карточки.
+      const memoryLabel = pickMemoryFromText(`${title} ${specs} ${blockText}`);
       const { rating, reviews } = parseRatingBlock(blockText);
       const brand = pickBrand(root, title);
       const colorHint = '';
@@ -346,11 +347,21 @@ function filterWbListings(items, opts) {
   });
 
   if (memNorm) {
-    out = out.filter((it) => {
+    const anyMemFound = out.some((it) => {
       const t = `${it.title || ''} ${it.memoryLabel || ''}`;
       const re = new RegExp(`\\b${memNorm}\\s*(gb|гб|гиг|tb|тб)?\\b`, 'i');
       return re.test(t) || t.includes(memNorm);
     });
+
+    // Если WB вернул товары, а память распознана у 0 карточек (из-за смены вёрстки/селекторов),
+    // memory-фильтр сделает Excel пустым. Тогда лучше не фильтровать по памяти.
+    if (anyMemFound) {
+      out = out.filter((it) => {
+        const t = `${it.title || ''} ${it.memoryLabel || ''}`;
+        const re = new RegExp(`\\b${memNorm}\\s*(gb|гб|гиг|tb|тб)?\\b`, 'i');
+        return re.test(t) || t.includes(memNorm);
+      });
+    }
   }
 
   if (colorRaw) {
