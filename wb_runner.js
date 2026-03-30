@@ -353,16 +353,12 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
   } else {
     log(`  [${pageLabel}] WB: проверка капчи / антибота…`);
   }
+  // Если капча/проверка видна сразу после загрузки — закрываем и уходим в IP-ротацию.
   if (await detectWbBlock(page)) {
     logBlock(
-      `[${pageLabel}] Wildberries — капча/проверка браузера обнаружена; ждём 20–25 сек и проверяем ещё раз`
+      `[${pageLabel}] Wildberries — капча/проверка браузера обнаружена; закрываем браузер и ждём новый IP`
     );
-    const cleared = await waitForWbBlockToClear(page, 25_000);
-    if (!cleared) {
-      logBlock(`[${pageLabel}] Wildberries — блок сохранился; закрываем браузер и ждём новый IP`);
-      hooks.onIpBlock();
-    }
-    log(`  [${pageLabel}] блок ушёл сам — продолжаем без IP-ротации.`);
+    hooks.onIpBlock();
   }
   if (isFirstPage) {
     logStep(7, 'Ограничений в тексте и виджетах не видно (WB)', 'продолжаем');
@@ -413,14 +409,9 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
       await randomDelay(SOFT.wbSettleAfterLoadMin, SOFT.wbSettleAfterLoadMax);
       if (await detectWbBlock(page)) {
         logBlock(
-          `[${pageLabel}] после перезагрузки WB — капча/проверка; ждём 15–20 сек и проверяем ещё раз`
+          `[${pageLabel}] после перезагрузки WB — капча/проверка обнаружена; закрываем браузер и ждём новый IP`
         );
-        const cleared = await waitForWbBlockToClear(page, 20_000);
-        if (!cleared) {
-          logBlock(`[${pageLabel}] блок сохранился после ожидания — ротация IP`);
-          hooks.onIpBlock();
-        }
-        log(`  [${pageLabel}] блок/проверка ушли — продолжаем.`);
+        hooks.onIpBlock();
       }
     }
 
@@ -432,14 +423,9 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
     } catch {
       if (await detectWbBlock(page)) {
         logBlock(
-          `[${pageLabel}] карточек нет — при проверке видна капча/проверка; ждём 15–20 сек и проверяем ещё раз`
+          `[${pageLabel}] карточек нет — при проверке видна капча/проверка; закрываем браузер и ждём новый IP`
         );
-        const cleared = await waitForWbBlockToClear(page, 20_000);
-        if (!cleared) {
-          logBlock(`[${pageLabel}] блок сохранился — ротация IP`);
-          hooks.onIpBlock();
-        }
-        log(`  [${pageLabel}] блок/проверка ушли — продолжаем ожидание карточек.`);
+        hooks.onIpBlock();
       }
       if (await hasWbEmptySerpMessage(page)) {
         throw new Error('Wildberries: пустая выдача по запросу.');
