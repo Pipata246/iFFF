@@ -86,24 +86,17 @@ const WB_HOME_URL = 'https://www.wildberries.ru/';
  */
 async function waitForWbDomAfterSoftHttp(page, reportedStatus) {
   log(
-    `  главный ответ HTTP ${reportedStatus} — часто «шум» прокси до готовности WB; ждём load и догрузку вёрстки…`
+    `  главный ответ HTTP ${reportedStatus} — часто «шум» прокси до готовности WB; ждём load и догрузку вёрстки (reload тут не делаем)…`
   );
   await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch((e) => {
     log(`  повторное ожидание load: ${String(e.message || e).slice(0, 96)}`);
   });
   await page.waitForLoadState('domcontentloaded', { timeout: 45_000 }).catch(() => {});
   await randomDelay(12_000, 22_000);
-  const n = await page.locator(WB_ITEM_SELECTOR).count().catch(() => 0);
-  if (n === 0) {
-    log('  карточек в DOM ещё нет — одна перезагрузка вкладки после мягкого HTTP…');
-    try {
-      await page.reload({ waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
-    } catch (e) {
-      log(`  reload после HTTP ${reportedStatus}: ${String(e.message || e).slice(0, 96)}`);
-    }
-    await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
-    await randomDelay(8000, 14_000);
-  }
+  // Важно: никаких reload здесь делать не надо.
+  // До шага DOM-gate у нас ещё не выполнена проверка капчи/блока,
+  // и WB часто банит за лишние перезагрузки в момент "browser check".
+  // DOM-gate (gateWbListingPageReady) уже сделает reload только когда карточки реально не появились.
 }
 
 const SOFT = {
@@ -607,6 +600,15 @@ async function runAttemptWb(params, opts = {}) {
       }
       await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
       await randomDelay(SOFT.wbHomeSettleMin, SOFT.wbHomeSettleMax);
+      // Перед любыми "активностями" мышью/скроллом проверяем, не запустилась ли
+      // "проверка браузера" / капча. Если она есть — НЕ трогаем страницу,
+      // закрываем браузер и уходим на IP-ротацию.
+      if (await detectBlock(page)) {
+        logBlock('WB: на главной обнаружена капча/проверка браузера — закрываем браузер и ждём ротацию IP');
+        skipEnterBeforeClose = true;
+        rememberWbListingForIpRetry({ domGateCtx, crawlState, openUrl });
+        throw new Error('IP_BLOCK');
+      }
       await wbWarmHumanPresence(page);
       await randomDelay(SOFT.wbBeforeSearchFromHomeMin, SOFT.wbBeforeSearchFromHomeMax);
     } else {

@@ -17,12 +17,15 @@ const { parsePriceNumber } = require('./utils');
 
 /**
  * Фильтр «встроенная память» в поиске WB: в URL добавляются `f4424=<id>` и `meta_charcs=true`.
- * Пример (пользователь): 128 ГБ → f4424=25425.
+ * По вашему URL/скриншоту: f4424=25425 соответствует 256 ГБ.
  * Другие объёмы: на wildberries.ru выберите фильтр памяти, скопируйте число после f4424 из адреса и добавьте строку в объект ниже.
  */
 const WB_MEMORY_FACET_PARAM = 'f4424';
 const WB_MEMORY_GB_TO_F4424 = {
-  128: 25425,
+  128: 12868,
+  256: 25425,
+  512: 117419,
+  1024: 231154,
 };
 
 /**
@@ -30,14 +33,14 @@ const WB_MEMORY_GB_TO_F4424 = {
  * @returns {number|null} объём в ГБ для карты WB_MEMORY_GB_TO_F4424
  */
 function parseWbMemoryGb(memoryRaw) {
-  const s = String(memoryRaw || '')
-    .trim()
-    .replace(/\s+/g, '')
-    .replace(/gb|гб/gi, '');
+  const s = String(memoryRaw || '').trim().replace(/\s+/g, '');
+  // Если пользователь ввёл "1ТБ" — интерпретируем как 1024 ГБ для маппинга f4424.
+  const hasTb = /tb|тб|терабайт/i.test(s);
   const digits = s.replace(/\D/g, '');
   if (!digits) return null;
   const n = parseInt(digits, 10);
-  return Number.isFinite(n) && n > 0 ? n : null;
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return hasTb ? n * 1024 : n;
 }
 
 /**
