@@ -303,6 +303,8 @@ async function parseWbListings(page) {
         rating,
         reviewsCount: reviews,
         colorHint,
+        // Для устойчивых фильтров (title на WB иногда извлекается неполностью).
+        filterText: blockText,
       });
     }
 
@@ -338,17 +340,25 @@ function filterWbListings(items, opts) {
 
   let out = items.slice();
 
-  out = out.filter((it) => {
-    const t = (it.title || '').toLowerCase();
-    for (const k of kw) {
-      if (!t.includes(k)) return false;
-    }
-    return true;
-  });
+  // WB сам уже фильтруется URL'ом по query/extraKeywords, но на некоторых версиях вёрстки
+  // title извлекается неполно. Поэтому: применяем фильтр extraKeywords только если он не обнуляет список.
+  if (kw.length > 0) {
+    const before = out.slice();
+    const filteredByKw = out.filter((it) => {
+      const t = `${it.title || ''} ${it.filterText || ''}`.toLowerCase();
+      for (const k of kw) {
+        if (!t.includes(k)) return false;
+      }
+      return true;
+    });
+    if (filteredByKw.length > 0) out = filteredByKw;
+    // иначе оставляем out без применения keyword-фильтра
+    else out = before;
+  }
 
   if (memNorm) {
     const anyMemFound = out.some((it) => {
-      const t = `${it.title || ''} ${it.memoryLabel || ''}`;
+      const t = `${it.title || ''} ${it.memoryLabel || ''} ${it.filterText || ''}`;
       const re = new RegExp(`\\b${memNorm}\\s*(gb|гб|гиг|tb|тб)?\\b`, 'i');
       return re.test(t) || t.includes(memNorm);
     });
@@ -356,16 +366,25 @@ function filterWbListings(items, opts) {
     // Если WB вернул товары, а память распознана у 0 карточек (из-за смены вёрстки/селекторов),
     // memory-фильтр сделает Excel пустым. Тогда лучше не фильтровать по памяти.
     if (anyMemFound) {
+      const beforeMem = out.slice();
       out = out.filter((it) => {
-        const t = `${it.title || ''} ${it.memoryLabel || ''}`;
+        const t = `${it.title || ''} ${it.memoryLabel || ''} ${it.filterText || ''}`;
         const re = new RegExp(`\\b${memNorm}\\s*(gb|гб|гиг|tb|тб)?\\b`, 'i');
         return re.test(t) || t.includes(memNorm);
       });
+      // Доп. защита: если из-за несовпадения формата памяти всё срезалось в 0 — не делаем пустой Excel.
+      if (out.length === 0) out = beforeMem;
     }
   }
 
   if (colorRaw) {
-    out = out.filter((it) => (it.title || '').toLowerCase().includes(colorRaw));
+    const before = out.slice();
+    const filteredByColor = out.filter((it) =>
+      `${it.title || ''} ${it.filterText || ''}`.toLowerCase().includes(colorRaw)
+    );
+    // Аналогично keywords: если из-за извлечения/вёрстки цвет не распознался корректно — не делаем пустой Excel.
+    if (filteredByColor.length > 0) out = filteredByColor;
+    else out = before;
   }
 
   out = out.filter((it) => {

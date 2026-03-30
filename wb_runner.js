@@ -426,6 +426,16 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
   let gotCards = false;
   for (let domTry = 0; domTry <= MAX_DOM_RELOAD_ATTEMPTS; domTry++) {
     if (domTry > 0) {
+      // Важно: если WB показывает "Проверяем браузер" (спиннер/проверка),
+      // не делаем reload до окончания этой внутренней проверки.
+      // Иначе сайт воспринимает лишние действия и начинает банить.
+      await waitForWbBrowserCheckFinish(page, 120_000);
+      if (await detectWbBlock(page)) {
+        logBlock(
+          `[${pageLabel}] перед reload обнаружена капча/проверка браузера — закрываем браузер и ждём новый IP`
+        );
+        hooks.onIpBlock();
+      }
       log(
         `  [${pageLabel}] перезагрузка страницы WB в той же сессии (${domTry}/${MAX_DOM_RELOAD_ATTEMPTS})…`
       );
