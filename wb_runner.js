@@ -28,6 +28,15 @@ const {
 let resumeListingUrlWb = null;
 let resumeSerpPageIndexWb = null;
 
+function isWbSearchUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    return u.hostname.toLowerCase().includes('wildberries.ru') && /\/catalog\/0\/search\.aspx$/i.test(u.pathname);
+  } catch (_) {
+    return false;
+  }
+}
+
 /**
  * @param {{ domGateCtx: { page: import('playwright').Page | null }, crawlState: { serpPageIndex: number }, openUrl: string }} ctx
  */
@@ -38,14 +47,18 @@ function rememberWbListingForIpRetry(ctx) {
     const p = domGateCtx.page;
     if (p && typeof p.url === 'function') {
       const u = p.url();
-      if (u && /wildberries\.ru/i.test(u) && !/^(chrome-error|about:|chrome:\/\/)/i.test(u)) {
+      if (
+        u &&
+        !/^(chrome-error|about:|chrome:\/\/)/i.test(u) &&
+        isWbSearchUrl(u)
+      ) {
         url = u;
       }
     }
   } catch (_) {
     /* keep openUrl */
   }
-  if (!/wildberries\.ru/i.test(url)) {
+  if (!isWbSearchUrl(url)) {
     url = openUrl;
   }
   resumeListingUrlWb = normalizeWbSearchUrlSingleFeed(url);
@@ -192,6 +205,45 @@ async function wbWarmHumanPresence(page) {
   for (let i = 0, n = randomInt(2, 5); i < n; i++) {
     await page.mouse.wheel(0, randomInt(30, 110));
     await randomDelay(800, 2400);
+  }
+}
+
+/**
+ * На WB часто всплывают баннеры/куки, которые перекрывают карточки и мешают скроллу.
+ * Закрываем типовые оверлеи, не ломая страницу.
+ * @param {import('playwright').Page} page
+ */
+async function dismissWbOverlays(page) {
+  const clicked = await page.evaluate(() => {
+    let n = 0;
+    const selectors = [
+      '[class*="modal"] [aria-label*="закры" i]',
+      '[class*="modal"] [aria-label*="close" i]',
+      '[class*="popup"] [aria-label*="закры" i]',
+      '[class*="popup"] [aria-label*="close" i]',
+      '[class*="overlay"] [aria-label*="закры" i]',
+      '[class*="cookie"] button',
+      '#onetrust-accept-btn-handler',
+      '[id*="cookie"] button',
+      '[class*="cookies"] button',
+      '[class*="banner"] [aria-label*="закры" i]',
+    ];
+    for (const sel of selectors) {
+      document.querySelectorAll(sel).forEach((el) => {
+        if (!(el instanceof HTMLElement)) return;
+        const txt = (el.textContent || '').toLowerCase();
+        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+        if (sel.includes('cookie') || /закры|close|ok|ок|принять|понятно/.test(`${txt} ${aria}`)) {
+          el.click();
+          n += 1;
+        }
+      });
+    }
+    return n;
+  }).catch(() => 0);
+  if (clicked > 0) {
+    log(`  WB: закрыли всплывающие окна/куки (${clicked}).`);
+    await randomDelay(800, 1800);
   }
 }
 
@@ -490,9 +542,14 @@ async function runAttemptWb(params, opts = {}) {
   if (openingFromResume) {
     resumeListingUrlWb = null;
     resumeSerpPageIndexWb = null;
-    log('  WB возобновление: сохранённый адрес выдачи (одна лента, без «страниц»).');
   }
-  const openUrl = normalizeWbSearchUrlSingleFeed(resumedUrl || builtUrl);
+  const safeResumeUrl = resumedUrl && isWbSearchUrl(resumedUrl) ? resumedUrl : null;
+  if (openingFromResume && safeResumeUrl) {
+    log('  WB возобновление: сохранённый адрес выдачи (одна лента, без «страниц»).');
+  } else if (openingFromResume && resumedUrl && !safeResumeUrl) {
+    log(`  WB: сохранённый URL не похож на выдачу (${resumedUrl}) — открываем URL поиска по текущим фильтрам.`);
+  }
+  const openUrl = normalizeWbSearchUrlSingleFeed(safeResumeUrl || builtUrl);
 
   const crawlState = { serpPageIndex: 1 };
 
@@ -531,7 +588,8 @@ async function runAttemptWb(params, opts = {}) {
       try {
         const p = domGateCtx.page;
         if (p) {
-          resumeListingUrlWb = normalizeWbSearchUrlSingleFeed(p.url());
+          const cur = p.url();
+          resumeListingUrlWb = normalizeWbSearchUrlSingleFeed(isWbSearchUrl(cur) ? cur : openUrl);
           resumeSerpPageIndexWb = 1;
           log(`  WB запомнили адрес ленты: ${resumeListingUrlWb}`);
         }
@@ -679,15 +737,18 @@ async function runAttemptWb(params, opts = {}) {
 
     log('  пауза перед сбором данных с выдачи WB (осторожный осмотр страницы, как на Avito)…');
     await randomDelay(SOFT.afterListingGateMin, SOFT.afterListingGateMax);
+    await dismissWbOverlays(page);
     let raw = [];
     let batch = await parseWbListings(page);
     raw.push(...batch);
     log(`  WB собрано записей (первый проход, верх ленты): ${batch.length}`);
 
     logStep(10, 'Скролл ленты Wildberries', 'имитация чтения и подгрузка карточек до упора');
+    await dismissWbOverlays(page);
     await humanBehavior(page);
     await scrollWbFeedUntilStable(page);
 
+    await dismissWbOverlays(page);
     batch = await parseWbListings(page);
     raw.push(...batch);
     raw = dedupeByHref(raw);
