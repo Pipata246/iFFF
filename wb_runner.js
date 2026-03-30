@@ -144,6 +144,40 @@ async function detectWbBlock(page) {
 }
 
 /**
+ * WB может показывать "Проверяем браузер" / spinner и только потом отдавать HTML/DOM.
+ * Чтобы не "долбить" reload/скроллом во время этой проверки, ждём её окончания до timeout.
+ * @param {import('playwright').Page} page
+ * @param {number} timeoutMs
+ * @returns {Promise<{ ended: boolean, timedOut: boolean, hardBlock: boolean }>}
+ */
+async function waitForWbBrowserCheckFinish(page, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+
+  async function isBrowserCheckInProgress() {
+    const body = await page.locator('body').innerText().catch(() => '');
+    const low = String(body || '').toLowerCase();
+    return (
+      /проверяем\s+браузер|проверяем\s+ваш\s+браузер|проверка\s+браузера|checking your browser/i.test(
+        low
+      ) || /почти\s+готово/i.test(low)
+    );
+  }
+
+  while (Date.now() < deadline) {
+    const hardBlock = await detectWbBlock(page);
+    if (hardBlock) return { ended: false, timedOut: false, hardBlock: true };
+
+    const inProgress = await isBrowserCheckInProgress();
+    if (!inProgress) return { ended: true, timedOut: false, hardBlock: false };
+
+    await randomDelay(5000, 8000);
+  }
+
+  const hardBlock = await detectWbBlock(page);
+  return { ended: false, timedOut: true, hardBlock };
+}
+
+/**
  * @param {import('playwright').Page} page
  * @param {number} reportedStatus
  */
@@ -353,7 +387,20 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
   } else {
     log(`  [${pageLabel}] WB: проверка капчи / антибота…`);
   }
-  // Если капча/проверка видна сразу после загрузки — закрываем и уходим в IP-ротацию.
+
+  // Ожидаем окончание "Проверяем браузер" до 120 секунд,
+  // чтобы не переходить к DOM-gate/парсингу до того, как сайт закончит проверку.
+  logStep(
+    7,
+    `WB: ожидание проверки браузера (до 120с) — ${pageLabel}`,
+    'Если появится капча/блок — уйдём на IP-rotation'
+  );
+  const wbCheck = await waitForWbBrowserCheckFinish(page, 120_000);
+  if (wbCheck.timedOut) {
+    logBlock(`[${pageLabel}] WB: проверка браузера не ушла за 120 сек (идём дальше с диагностикой)`);
+  }
+
+  // Если после ожидания осталась капча/блокировка — закрываем и уходим в IP-ротацию.
   if (await detectWbBlock(page)) {
     logBlock(
       `[${pageLabel}] Wildberries — капча/проверка браузера обнаружена; закрываем браузер и ждём новый IP`
@@ -407,6 +454,10 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
       }
       await page.waitForLoadState('load', { timeout: PAGE_LOAD_TIMEOUT_MS }).catch(() => {});
       await randomDelay(SOFT.wbSettleAfterLoadMin, SOFT.wbSettleAfterLoadMax);
+
+      // После reload тоже ждём окончания "Проверяем браузер" до 120 секунд,
+      // и только после этого проверяем капчу/блок.
+      await waitForWbBrowserCheckFinish(page, 120_000);
       if (await detectWbBlock(page)) {
         logBlock(
           `[${pageLabel}] после перезагрузки WB — капча/проверка обнаружена; закрываем браузер и ждём новый IP`
@@ -421,9 +472,11 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
       gotCards = true;
       break;
     } catch {
+      // Перед принятием решения (reload/rotation) даём WB закончить внутреннюю проверку.
+      await waitForWbBrowserCheckFinish(page, 120_000);
       if (await detectWbBlock(page)) {
         logBlock(
-          `[${pageLabel}] карточек нет — при проверке видна капча/проверка; закрываем браузер и ждём новый IP`
+          `[${pageLabel}] карточек нет, но после ожидания видна капча/проверка; закрываем браузер и ждём новый IP`
         );
         hooks.onIpBlock();
       }
