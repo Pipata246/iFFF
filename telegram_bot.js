@@ -1,3 +1,35 @@
+const fs = require('fs');
+const path = require('path');
+
+function loadDotEnvIfPresent() {
+  try {
+    const envPath = path.join(process.cwd(), '.env');
+    if (!fs.existsSync(envPath)) return;
+    const raw = fs.readFileSync(envPath, 'utf8');
+    for (const line of raw.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t || t.startsWith('#')) continue;
+      const eq = t.indexOf('=');
+      if (eq <= 0) continue;
+      const key = t.slice(0, eq).trim();
+      let val = t.slice(eq + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+      if (process.env[key] == null || process.env[key] === '') {
+        process.env[key] = val;
+      }
+    }
+  } catch (_) {
+    // ignore
+  }
+}
+
+loadDotEnvIfPresent();
+
 const token = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN;
 
 if (!token) {
