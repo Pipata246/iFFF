@@ -650,6 +650,38 @@ function ask(rl, q) {
  * @returns {Promise<import('./parser').SearchParams & { memory: string, minRating: number, onlyToday: boolean, marketplace: 'avito'|'wb'|'both', color: string }>}
  */
 async function collectParams() {
+  const useEnvParams = process.env.PARSER_USE_ENV === '1' || process.env.PARSER_USE_ENV === 'true';
+  if (useEnvParams) {
+    const rawMarketplace = String(process.env.PARSER_MARKETPLACE || 'avito').trim().toLowerCase();
+    const marketplace = ['avito', 'wb', 'both'].includes(rawMarketplace) ? rawMarketplace : 'avito';
+    const query = String(process.env.PARSER_QUERY || '').trim();
+    const extraKeywords = String(process.env.PARSER_EXTRA_KEYWORDS || '').trim();
+    const city = String(process.env.PARSER_CITY || '').trim();
+    const minPrice = parseInt(String(process.env.PARSER_MIN_PRICE || '0'), 10) || 0;
+    const maxPrice = parseInt(String(process.env.PARSER_MAX_PRICE || '0'), 10) || 0;
+    const memory = String(process.env.PARSER_MEMORY || '').trim();
+    const sellerRaw = String(process.env.PARSER_SELLER_TYPE || 'any').trim().toLowerCase();
+    const sellerType = ['private', 'company', 'any'].includes(sellerRaw) ? sellerRaw : 'any';
+    const minRating = parseFloat(String(process.env.PARSER_MIN_RATING || '0').replace(',', '.')) || 0;
+    const ot = String(process.env.PARSER_ONLY_TODAY || '').trim().toLowerCase();
+    const onlyToday =
+      ot === 'да' || ot === 'д' || ot === '+' || ot === 'yes' || ot === 'y' || ot === '1' || ot === 'true';
+    const color = String(process.env.PARSER_COLOR || '').trim();
+    return {
+      marketplace,
+      query,
+      extraKeywords,
+      city,
+      minPrice,
+      maxPrice,
+      memory,
+      sellerType,
+      minRating,
+      onlyToday,
+      color,
+    };
+  }
+
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
   try {

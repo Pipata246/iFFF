@@ -1,0 +1,14 @@
+node_modules/
+
+# secrets
+.env
+.env.*
+
+# results
+results_*.xlsx
+*.xlsx
+
+# playwright
+playwright-report/
+test-results/
+.cache/

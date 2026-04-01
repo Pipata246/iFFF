@@ -1,0 +1,17 @@
+[Unit]
+Description=iFind telegram bot service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ifind
+EnvironmentFile=/opt/ifind/.env
+ExecStart=/usr/bin/npm run bot
+Restart=always
+RestartSec=5
+User=root
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
