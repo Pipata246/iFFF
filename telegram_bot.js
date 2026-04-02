@@ -65,6 +65,9 @@ const TG_API = `https://api.telegram.org/bot${token}`;
 let offset = Number(process.env.TELEGRAM_BOT_OFFSET || 0);
 let running = true;
 
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function isRetryableNetErr(err) {
@@ -120,6 +123,40 @@ async function handleMessage(msg) {
   if (!text) return;
 
   if (/^\/start(?:@\w+)?(?:\s+.*)?$/i.test(text)) {
+    // Insert user into Supabase on /start.
+    // If Supabase vars are missing, we silently skip to keep bot working.
+    try {
+      const from = msg.from;
+      const tgUserId = from && from.id != null ? String(from.id) : '';
+      if (SUPABASE_URL && SUPABASE_ANON_KEY && tgUserId) {
+        const payload = [
+          {
+            telegram_user_id: tgUserId,
+            telegram_username: from.username || null,
+            first_name: from.first_name || null,
+            last_name: from.last_name || null,
+          },
+        ];
+
+        const resp = await fetch(`${SUPABASE_URL}/rest/v1/users`, {
+          method: 'POST',
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+            'content-type': 'application/json',
+            Prefer: 'resolution=merge-duplicates,return=minimal',
+          },
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const txt = await resp.text().catch(() => '');
+          throw new Error(`Supabase HTTP ${resp.status}: ${txt || '(empty body)'}`);
+        }
+      }
+    } catch (err) {
+      console.error('Supabase insert error:', String(err?.message || err || ''));
+    }
+
     await sendMessage(chatId, startText);
     return;
   }
