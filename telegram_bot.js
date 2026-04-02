@@ -142,12 +142,12 @@ async function handleMessage(msg) {
             last_name: from.last_name || null,
           },
         ];
+        console.log('Supabase payload telegram_user_id:', payload?.[0]?.telegram_user_id);
 
         const resp = await fetch(`${SUPABASE_URL}/rest/v1/users`, {
           method: 'POST',
           headers: {
             apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
             'content-type': 'application/json',
             Prefer: 'resolution=merge-duplicates,return=minimal',
           },
