@@ -460,7 +460,9 @@ async function supabaseUpsertMarketSettings(tgUserId, marketplace, s) {
       only_today: Boolean(s.onlyToday),
     },
   ];
-  const resp = await fetch(`${SUPABASE_URL}/rest/v1/user_market_settings`, {
+  const resp = await fetch(
+    `${SUPABASE_URL}/rest/v1/user_market_settings?on_conflict=telegram_user_id,marketplace`,
+    {
     method: 'POST',
     headers: {
       apikey: SUPABASE_ANON_KEY,
@@ -468,7 +470,8 @@ async function supabaseUpsertMarketSettings(tgUserId, marketplace, s) {
       Prefer: 'resolution=merge-duplicates,return=minimal',
     },
     body: JSON.stringify(payload),
-  });
+    }
+  );
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '');
     throw new Error(`Supabase user_market_settings upsert failed: HTTP ${resp.status}: ${txt}`);
