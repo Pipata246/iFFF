@@ -396,21 +396,13 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
     logBlock(`[${pageLabel}] WB: проверка браузера не ушла за 120 сек (идём дальше с диагностикой)`);
   }
 
-  // Если после ожидания осталась капча/блокировка — закрываем и уходим в IP-ротацию.
+  // Если после ожидания "проверки браузера" всё ещё видим капчу/блок —
+  // сразу уходим в IP-ротацию, чтобы не делать ранние повторы в той же сессии/IP.
   if (await detectWbBlock(page)) {
     logBlock(
-      `[${pageLabel}] Wildberries — капча/проверка обнаружена; подтверждаем после доп. ожидания загрузки…`
+      `[${pageLabel}] Wildberries — капча/проверка подтверждена; сразу запускаем паузу ротации IP (120–130с)`
     );
-    await randomDelay(15_000, 25_000);
-    await page.waitForLoadState('load', { timeout: 45_000 }).catch(() => {});
-    if (await detectWbBlock(page)) {
-      logBlock(
-        `[${pageLabel}] Wildberries — капча/проверка подтверждена; закрываем браузер и ждём новый IP`
-      );
-      hooks.onIpBlock();
-    } else {
-      log(`  [${pageLabel}] блок не подтвердился после ожидания — продолжаем.`);
-    }
+    hooks.onIpBlock();
   }
   if (isFirstPage) {
     logStep(7, 'Ограничений в тексте и виджетах не видно (WB)', 'продолжаем');
