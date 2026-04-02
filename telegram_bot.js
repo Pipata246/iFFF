@@ -94,6 +94,8 @@ const SETTINGS_EDIT = '✏️ Изменить настройки';
 const SETTINGS_AVITO = '🛒 Настроить Авито';
 const SETTINGS_WB = '🛍️ Настроить ВБ';
 const SETTINGS_SAVE = '💾 Сохранить настройки';
+const RUN_CONTINUE_AUTO = '▶️ Продолжить с настройками автопарсинга';
+const RUN_SET_MANUAL = '✍️ Задать вручную';
 
 function wizardYesNoKeyboard() {
   return yesNoKeyboard(WIZARD_YES, WIZARD_NO);
@@ -193,6 +195,7 @@ function getUserState(chatId) {
       stage: 'main', // main | choosing_market | settings_only_today | settings_price | settings_memory | settings_color
       runDraft: null,
       configureOnly: false,
+      selectedMarketplaceForRun: null,
       marketSettings: {
         avito: null,
         wb: null,
@@ -800,6 +803,7 @@ async function handleMessage(msg) {
   if (text === MENU.manualRun) {
     state.stage = 'choosing_market';
     state.runDraft = null;
+    state.selectedMarketplaceForRun = null;
     await sendMessage(chatId, '🚀 Выберите площадку для ручного запуска:', buildMarketplaceKeyboard());
     return;
   }
@@ -902,40 +906,115 @@ async function handleMessage(msg) {
   // Stage: choosing marketplace
   if (state.stage === 'choosing_market') {
     if (text === '🛒 Авито' || text === 'Авито') {
-      const av = state.marketSettings.avito;
-      state.runDraft = {
-        marketplace: 'avito',
-        query: av?.query || 'iPhone',
-        extraKeywords: av?.extraKeywords || '',
-        city: av?.city || 'moskva',
-        minPrice: Number(av?.minPrice || 0),
-        maxPrice: Number(av?.maxPrice || 0),
-        memory: av?.memory || '',
-        onlyToday: Boolean(av?.onlyToday),
-        color: av?.color || '',
-      };
-      state.stage = 'run_query';
-      await sendMessage(chatId, '📝 Шаг 1/7: Введите название поиска (например: iPhone):', { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
+      state.selectedMarketplaceForRun = 'avito';
+      state.stage = 'run_mode_choice';
+      await sendMessage(
+        chatId,
+        '🛒 Авито выбрано. Как продолжить?',
+        {
+          keyboard: [[{ text: RUN_CONTINUE_AUTO }], [{ text: RUN_SET_MANUAL }], [{ text: MENU.backToMenu }]],
+          resize_keyboard: true,
+          one_time_keyboard: false,
+        }
+      );
       return;
     }
     if (text === '🛍️ ВБ' || text === 'ВБ') {
-      const wb = state.marketSettings.wb;
-      state.runDraft = {
-        marketplace: 'wb',
-        query: wb?.query || 'iPhone',
-        extraKeywords: wb?.extraKeywords || '',
-        city: wb?.city || 'moskva',
-        minPrice: Number(wb?.minPrice || 0),
-        maxPrice: Number(wb?.maxPrice || 0),
-        memory: wb?.memory || '',
-        onlyToday: Boolean(wb?.onlyToday),
-        color: wb?.color || '',
-      };
-      state.stage = 'run_query';
-      await sendMessage(chatId, '📝 Шаг 1/7: Введите название поиска (например: iPhone):', { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
+      state.selectedMarketplaceForRun = 'wb';
+      state.stage = 'run_mode_choice';
+      await sendMessage(
+        chatId,
+        '🛍️ ВБ выбрано. Как продолжить?',
+        {
+          keyboard: [[{ text: RUN_CONTINUE_AUTO }], [{ text: RUN_SET_MANUAL }], [{ text: MENU.backToMenu }]],
+          resize_keyboard: true,
+          one_time_keyboard: false,
+        }
+      );
       return;
     }
     await sendMessage(chatId, '👇 Выбери площадку кнопкой снизу.', buildMarketplaceKeyboard());
+    return;
+  }
+
+  if (state.stage === 'run_mode_choice') {
+    const m = state.selectedMarketplaceForRun || 'avito';
+    if (text === RUN_SET_MANUAL) {
+      const current = m === 'wb' ? state.marketSettings.wb : state.marketSettings.avito;
+      state.runDraft = {
+        marketplace: m,
+        query: current?.query || 'iPhone',
+        extraKeywords: current?.extraKeywords || '',
+        city: current?.city || 'moskva',
+        minPrice: Number(current?.minPrice || 0),
+        maxPrice: Number(current?.maxPrice || 0),
+        memory: current?.memory || '',
+        onlyToday: Boolean(current?.onlyToday),
+        color: current?.color || '',
+      };
+      state.stage = 'run_query';
+      await sendMessage(
+        chatId,
+        `📝 Шаг 1/${m === 'avito' ? '8' : '7'}: Введите название поиска (например: iPhone):`,
+        { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false }
+      );
+      return;
+    }
+
+    if (text === RUN_CONTINUE_AUTO) {
+      // pull latest settings from DB for selected marketplace
+      try {
+        const rows = await supabaseFetchMarketSettingsAll(msg.from?.id);
+        const row = rows.find((r) => String(r.marketplace || '').toLowerCase() === m);
+        const cached = m === 'wb' ? state.marketSettings.wb : state.marketSettings.avito;
+        const s = row ? mapRowToMarketSettings(row) : cached;
+        if (!s) {
+          await sendMessage(
+            chatId,
+            `⚠️ Для площадки ${m === 'avito' ? 'Авито' : 'ВБ'} настройки пока пустые.\nВыберите "✍️ Задать вручную" или откройте "⚙️ Настройки автопарсинга".`,
+            {
+              keyboard: [[{ text: RUN_SET_MANUAL }], [{ text: MENU.autoSettings }], [{ text: MENU.backToMenu }]],
+              resize_keyboard: true,
+              one_time_keyboard: false,
+            }
+          );
+          return;
+        }
+
+        await runParserForMarketplace({
+          chatId,
+          marketplace: m,
+          parserOverrides: {
+            marketplace: m,
+            query: s.query || 'iPhone',
+            extraKeywords: s.extraKeywords || '',
+            city: s.city || 'moskva',
+            minPrice: s.minPrice || 0,
+            maxPrice: s.maxPrice || 0,
+            memory: s.memory || '',
+            onlyToday: Boolean(s.onlyToday),
+            color: s.color || '',
+          },
+        });
+        return;
+      } catch (e) {
+        await sendMessage(chatId, `⚠️ Не удалось прочитать настройки: ${String(e?.message || e || '')}`, mainKeyboard);
+        return;
+      }
+    }
+
+    if (text === MENU.backToMenu) {
+      state.stage = 'main';
+      state.selectedMarketplaceForRun = null;
+      await sendMessage(chatId, '⬅️ Возврат в меню.', mainKeyboard);
+      return;
+    }
+
+    await sendMessage(chatId, '👇 Выберите вариант продолжения кнопкой снизу.', {
+      keyboard: [[{ text: RUN_CONTINUE_AUTO }], [{ text: RUN_SET_MANUAL }], [{ text: MENU.backToMenu }]],
+      resize_keyboard: true,
+      one_time_keyboard: false,
+    });
     return;
   }
 
