@@ -146,12 +146,14 @@ async function tgApi(method, payload) {
   throw lastErr;
 }
 
-async function sendMessage(chatId, text, replyMarkup) {
-  return tgApi('sendMessage', {
+async function sendMessage(chatId, text, replyMarkup, parseMode = null) {
+  const payload = {
     chat_id: chatId,
     text,
     reply_markup: replyMarkup || mainKeyboard,
-  });
+  };
+  if (parseMode) payload.parse_mode = parseMode;
+  return tgApi('sendMessage', payload);
 }
 
 async function sendDocument(chatId, filePath, caption) {
@@ -831,11 +833,17 @@ async function handleMessage(msg) {
     state.stage = 'main';
     await sendMessage(
       chatId,
-      'Как пользоваться:\n' +
-        '1) `Настройки автопарсинга` — включи нужные фильтры кнопками.\n' +
-        '2) `Ручной запуск` — выбери `Авито` или `ВБ`.\n' +
-        '3) `Эксель файлы` — получишь список созданных Excel.\n',
-      mainKeyboard
+      '📘 *Инструкция*\n\n' +
+        '1️⃣ Нажми _⚙️ Настройки автопарсинга_ и заполни параметры.\n' +
+        '2️⃣ Нажми _🚀 Ручной запуск_ и выбери площадку _🛒 Авито_ или _🛍️ ВБ_.\n' +
+        '3️⃣ Дождись этапов парсинга:\n' +
+        '   • 🌐 Открываю страницу\n' +
+        '   • ✅ Страница открыта, начинаю парсинг\n' +
+        '   • 📁 Парсинг завершен, файл сохранен\n' +
+        '4️⃣ Нажми _📁 Эксель файлы_, чтобы увидеть список файлов на сервере.\n\n' +
+        '🧷 Во время парсинга можно нажать _⛔ Остановить парсинг_.',
+      mainKeyboard,
+      'Markdown'
     );
     return;
   }
