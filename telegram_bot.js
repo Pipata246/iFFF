@@ -618,7 +618,7 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
     // В Telegram отправляем только 3 этапа, подробные строки остаются в terminal/journalctl.
     if (!stage3Emitted && !stage1Sent && (s.includes('Адрес поиска') || s.includes('Переход на') || s.includes('Открываю страницу'))) {
       stage1Sent = true;
-      sendMessage(chatId, '1) 🌐 Открываю страницу', stopKeyboard).catch(() => {});
+      sendMessage(chatId, '🌐 Захожу на страницу', stopKeyboard).catch(() => {});
     }
 
     if (
@@ -631,7 +631,7 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
         s.includes('Парсинг карточек'))
     ) {
       stage2Sent = true;
-      sendMessage(chatId, '2) ✅ Страница открыта, собираю данные', stopKeyboard).catch(() => {});
+      sendMessage(chatId, '✅ Страница открыта, собираю данные', stopKeyboard).catch(() => {});
     }
   }
 
@@ -700,8 +700,8 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
       await sendMessage(
         chatId,
         bestFile
-          ? `✅ 3) Парсинг завершен, ваш файл сохранен: ${bestFile}`
-          : '⚠️ 3) Парсинг завершен, но новый файл Excel не найден.',
+          ? `✅ Парсинг завершен, ваш файл сохранен: ${bestFile}`
+          : '⚠️ Парсинг завершен, но новый файл Excel не найден.',
         mainKeyboard
       );
     } catch (e) {

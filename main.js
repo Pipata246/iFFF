@@ -660,6 +660,36 @@ async function confirmAvitoBlockAfterSoftWait(page, pageLabel) {
 }
 
 /**
+ * Диагностика состояния страницы перед решением о блоке:
+ * помогает понять, дошли ли до Avito или упёрлись в сетевой/прокси сбой.
+ * @param {import('playwright').Page} page
+ * @param {string} label
+ */
+async function logAvitoPageDiagnostics(page, label) {
+  try {
+    const currentUrl = page.url();
+    const title = await page.title().catch(() => '');
+    const itemCount = await page.locator(ITEM_SELECTOR).count().catch(() => 0);
+    const bodySnippet = await page
+      .evaluate(() => {
+        const t = (document.body && document.body.innerText) || '';
+        return t.replace(/\s+/g, ' ').trim().slice(0, 420);
+      })
+      .catch(() => '');
+    log(`  [diag:${label}] url: ${currentUrl || '—'}`);
+    log(`  [diag:${label}] title: ${title || '—'}`);
+    log(`  [diag:${label}] cards in DOM: ${itemCount}`);
+    if (bodySnippet) {
+      log(`  [diag:${label}] text: ${bodySnippet}`);
+    } else {
+      log(`  [diag:${label}] text: <пусто/не удалось прочитать body>`);
+    }
+  } catch (e) {
+    log(`  [diag:${label}] ошибка диагностики: ${String(e && e.message ? e.message : e)}`);
+  }
+}
+
+/**
  * @param {import('readline').Interface} rl
  * @param {string} q
  * @returns {Promise<string>}
@@ -971,6 +1001,7 @@ async function runAttempt(params) {
         if (st === 403 || st === 429) {
           log(`  ответ сервера: HTTP ${st} — ограничение по IP / частота запросов`);
           logNetFailureHelp(new Error(`HTTP ${st}`));
+          await logAvitoPageDiagnostics(page, `http-${st}-after-goto`);
           const blockedConfirmed = await confirmAvitoBlockAfterSoftWait(page, 'первая навигация Avito');
           if (blockedConfirmed) {
             skipEnterBeforeClose = true;
@@ -991,6 +1022,7 @@ async function runAttempt(params) {
       if (isLikelyProxyOrTunnelDrop(navErr)) {
         log(`  навигация: ${m}`);
         logNetFailureHelp(navErr);
+        await logAvitoPageDiagnostics(page, 'tunnel-drop-before-retry');
         log('  Мягкий режим: ждём и делаем один повтор goto в этой же сессии перед ротацией IP…');
         await randomDelay(12_000, 22_000);
         try {
@@ -999,6 +1031,7 @@ async function runAttempt(params) {
             const retryStatus = retryResp.status();
             if (retryStatus === 403 || retryStatus === 429) {
               log(`  повтор goto: HTTP ${retryStatus} — перепроверяем блок перед ротацией IP…`);
+              await logAvitoPageDiagnostics(page, `retry-http-${retryStatus}`);
               const blockedConfirmed = await confirmAvitoBlockAfterSoftWait(page, 'повторная навигация Avito');
               if (blockedConfirmed) {
                 skipEnterBeforeClose = true;
