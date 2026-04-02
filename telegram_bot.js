@@ -127,10 +127,11 @@ async function tgApi(method, payload) {
   let lastErr = null;
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     try {
+      const isFormData = typeof FormData !== 'undefined' && payload instanceof FormData;
       const resp = await fetch(`${TG_API}/${method}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload || {}),
+        headers: isFormData ? undefined : { 'content-type': 'application/json' },
+        body: isFormData ? payload : JSON.stringify(payload || {}),
       });
       const data = await resp.json();
       if (!resp.ok || !data.ok) {
