@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 // Minimal .env loader (so VPS can keep secrets in /opt/ifind/.env)
@@ -52,8 +53,16 @@ const MENU = {
   autoSettings: '⚙️ Настройки автопарсинга',
   guide: '📘 Инструкция',
   excels: '📁 Эксель файлы',
+  checkAutoparse: '🔎 Проверить автопарсинг',
+  avitoParams: '🛒 Параметры Авито',
   backToMenu: '⬅️ Назад в меню',
 };
+
+/** Подменю автопарсинга (только Wildberries). */
+const AUTO_WB_FILTERS = '🔧 Настроить фильтры';
+const AUTO_WB_INTERVAL = '⏱ Настроить периодичность';
+const AUTO_WB_ENABLED = '✅ Автопарсинг ВКЛ';
+const AUTO_WB_DISABLED = '⏸ Автопарсинг ВЫКЛ';
 
 const STOP_PARSING_TEXT = '⛔ Остановить парсинг';
 
@@ -69,6 +78,7 @@ const mainKeyboard = {
   keyboard: [
     [{ text: MENU.manualRun }, { text: MENU.autoSettings }],
     [{ text: MENU.guide }, { text: MENU.excels }],
+    [{ text: MENU.checkAutoparse }, { text: MENU.avitoParams }],
   ],
   resize_keyboard: true,
   one_time_keyboard: false,
@@ -76,9 +86,10 @@ const mainKeyboard = {
 
 const startText =
   '🤖 Бот помогает находить выгодные iPhone на Авито и Wildberries.\n\n' +
-  '📌 Нажми кнопку `Ручной запуск` и выбери площадку.\n\n' +
-  '⚙️ В `Настройки автопарсинга` задай фильтры кнопками.\n\n' +
-  '📁 В `Эксель файлы` получишь список файлов на сервере.';
+  '📌 `Ручной запуск` — выбери площадку и параметры.\n\n' +
+  '⚙️ `Настройки автопарсинга` — автообход ВБ по расписанию и уведомления о новых объявлениях.\n\n' +
+  '🔎 `Проверить автопарсинг` — статус и время следующего запуска.\n\n' +
+  '📁 `Эксель файлы` — список и выгрузка результатов.';
 
 const yesNoKeyboard = (yesText, noText) => ({
   keyboard: [[{ text: yesText }, { text: noText }]],
@@ -225,6 +236,7 @@ function getUserState(chatId) {
         avito: null,
         wb: null,
       },
+      returnToAutoMenu: false,
     });
   }
   return userStateByChatId.get(chatId);
@@ -616,6 +628,215 @@ async function supabaseDeleteExcelFileByPath(filePath) {
   }
 }
 
+/** Отпечаток фильтров ВБ для сброса базы при изменении настроек. */
+function wbSettingsFingerprintFromDraft(d) {
+  const payload = JSON.stringify({
+    q: String(d.query || '').trim(),
+    e: String(d.extraKeywords || '').trim(),
+    min: Number(d.minPrice || 0),
+    max: Number(d.maxPrice || 0),
+    mem: String(d.memory || '').trim(),
+    col: String(d.color || '').trim(),
+  });
+  return crypto.createHash('sha256').update(payload).digest('hex').slice(0, 40);
+}
+
+async function supabaseFetchWbAutoparseState(tgUserId) {
+  const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  if (!hasSupabaseCfg || tgUserId == null) return null;
+  const qs = new URLSearchParams({
+    telegram_user_id: `eq.${String(tgUserId)}`,
+    select:
+      'telegram_user_id,interval_minutes,enabled,is_running,baseline_ready,settings_fingerprint,last_run_started_at,last_run_finished_at,last_run_ok,next_scheduled_at',
+    limit: '1',
+  });
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/wb_autoparse_state?${qs.toString()}`, {
+    headers: { apikey: SUPABASE_ANON_KEY, 'content-type': 'application/json' },
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`wb_autoparse_state select failed: HTTP ${resp.status}: ${txt}`);
+  }
+  const rows = await resp.json();
+  return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+}
+
+async function supabaseUpsertWbAutoparseState(tgUserId, patch) {
+  const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  if (!hasSupabaseCfg || tgUserId == null) return;
+  const row = {
+    telegram_user_id: String(tgUserId),
+    ...patch,
+  };
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/wb_autoparse_state?on_conflict=telegram_user_id`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      'content-type': 'application/json',
+      Prefer: 'resolution=merge-duplicates,return=minimal',
+    },
+    body: JSON.stringify([row]),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`wb_autoparse_state upsert failed: HTTP ${resp.status}: ${txt}`);
+  }
+}
+
+async function supabaseDeleteWbSeenListings(tgUserId) {
+  const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  if (!hasSupabaseCfg || tgUserId == null) return;
+  const qs = new URLSearchParams({ telegram_user_id: `eq.${String(tgUserId)}` });
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/wb_seen_listings?${qs.toString()}`, {
+    method: 'DELETE',
+    headers: { apikey: SUPABASE_ANON_KEY, Prefer: 'return=minimal' },
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`wb_seen_listings delete failed: HTTP ${resp.status}: ${txt}`);
+  }
+}
+
+async function supabaseFetchWbSeenIdsSet(tgUserId) {
+  const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  if (!hasSupabaseCfg || tgUserId == null) return new Set();
+  const qs = new URLSearchParams({
+    telegram_user_id: `eq.${String(tgUserId)}`,
+    select: 'listing_id',
+  });
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/wb_seen_listings?${qs.toString()}`, {
+    headers: { apikey: SUPABASE_ANON_KEY },
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`wb_seen_listings select failed: HTTP ${resp.status}: ${txt}`);
+  }
+  const rows = await resp.json();
+  const set = new Set();
+  if (Array.isArray(rows)) {
+    for (const r of rows) {
+      if (r && r.listing_id) set.add(String(r.listing_id));
+    }
+  }
+  return set;
+}
+
+async function supabaseInsertWbSeenBatch(tgUserId, listingIds) {
+  const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  if (!hasSupabaseCfg || !listingIds.length) return;
+  const chunkSize = 400;
+  for (let i = 0; i < listingIds.length; i += chunkSize) {
+    const chunk = listingIds.slice(i, i + chunkSize).map((listing_id) => ({
+      telegram_user_id: String(tgUserId),
+      listing_id: String(listing_id),
+    }));
+    const resp = await fetch(
+      `${SUPABASE_URL}/rest/v1/wb_seen_listings?on_conflict=telegram_user_id,listing_id`,
+      {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          'content-type': 'application/json',
+          Prefer: 'resolution=merge-duplicates,return=minimal',
+        },
+        body: JSON.stringify(chunk),
+      }
+    );
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw new Error(`wb_seen_listings insert failed: HTTP ${resp.status}: ${txt}`);
+    }
+  }
+}
+
+async function supabaseFetchDueWbAutoparseUsers() {
+  const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  if (!hasSupabaseCfg) return [];
+  const qs = new URLSearchParams({
+    enabled: 'eq.true',
+    is_running: 'eq.false',
+    select:
+      'telegram_user_id,interval_minutes,enabled,baseline_ready,settings_fingerprint,next_scheduled_at',
+    order: 'next_scheduled_at.asc.nullsfirst',
+    limit: '25',
+  });
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/wb_autoparse_state?${qs.toString()}`, {
+    headers: { apikey: SUPABASE_ANON_KEY },
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    console.error('wb_autoparse due list failed:', txt);
+    return [];
+  }
+  const rows = await resp.json();
+  if (!Array.isArray(rows)) return [];
+  const now = Date.now();
+  const filtered = rows.filter((r) => {
+    if (r.next_scheduled_at == null || r.next_scheduled_at === '') return true;
+    const t = new Date(r.next_scheduled_at).getTime();
+    return !Number.isNaN(t) && t <= now;
+  });
+  filtered.sort((a, b) => {
+    const ta = a.next_scheduled_at ? new Date(a.next_scheduled_at).getTime() : 0;
+    const tb = b.next_scheduled_at ? new Date(b.next_scheduled_at).getTime() : 0;
+    const fa = Number.isNaN(ta) ? 0 : ta;
+    const fb = Number.isNaN(tb) ? 0 : tb;
+    return fa - fb;
+  });
+  return filtered;
+}
+
+async function supabaseResetAllWbAutoparseRunning() {
+  const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  if (!hasSupabaseCfg) return;
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/wb_autoparse_state?is_running=eq.true`, {
+      method: 'PATCH',
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        'content-type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({ is_running: false }),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      console.error('wb_autoparse reset running flags:', txt);
+    }
+  } catch (e) {
+    console.error('wb_autoparse reset running:', String(e?.message || e || ''));
+  }
+}
+
+function buildAutoWbMenuKeyboard() {
+  return {
+    keyboard: [
+      [{ text: AUTO_WB_FILTERS }],
+      [{ text: AUTO_WB_INTERVAL }],
+      [{ text: MENU.backToMenu }],
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
+}
+
+function buildWbIntervalKeyboard(st) {
+  const enabled = st && st.enabled !== false;
+  const rowToggle = enabled
+    ? [{ text: AUTO_WB_DISABLED }]
+    : [{ text: AUTO_WB_ENABLED }];
+  return {
+    keyboard: [
+      [{ text: '10 мин' }, { text: '15 мин' }, { text: '30 мин' }],
+      [{ text: '45 мин' }, { text: '60 мин' }],
+      rowToggle,
+      [{ text: MENU.backToMenu }],
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
+}
+
 let isParsing = false;
 let lastRunMarketplace = null;
 const activeChildByChatId = new Map(); // chatId -> child process
@@ -675,9 +896,127 @@ function buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides =
   };
 }
 
-async function runParserForMarketplace({ chatId, marketplace, parserOverrides = null }) {
+/**
+ * Завершение тихого автопарсинга ВБ: база при первом запуске, уведомления о новых позже.
+ * @param {number} intervalMinutes — интервал до следующего запуска из настроек
+ */
+async function processWbAutoparseResult(chatId, exitCode, snapshotPath, intervalMinutes, stopped) {
+  const interval = Number.isFinite(Number(intervalMinutes)) && Number(intervalMinutes) > 0 ? Number(intervalMinutes) : 30;
+  const nextIso = new Date(Date.now() + interval * 60_000).toISOString();
+
+  const safeUnlink = (p) => {
+    try {
+      if (p && fs.existsSync(p)) fs.unlinkSync(p);
+    } catch (_) {
+      /* ignore */
+    }
+  };
+
+  if (stopped) {
+    await supabaseUpsertWbAutoparseState(chatId, {
+      is_running: false,
+      last_run_finished_at: new Date().toISOString(),
+      last_run_ok: false,
+      next_scheduled_at: nextIso,
+    });
+    safeUnlink(snapshotPath);
+    return;
+  }
+
+  await supabaseUpsertWbAutoparseState(chatId, {
+    is_running: false,
+    last_run_finished_at: new Date().toISOString(),
+    last_run_ok: exitCode === 0,
+    next_scheduled_at: nextIso,
+  });
+
+  if (exitCode !== 0 || !snapshotPath || !fs.existsSync(snapshotPath)) {
+    safeUnlink(snapshotPath);
+    return;
+  }
+
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+  } catch (e) {
+    console.error('WB snapshot JSON read error:', String(e?.message || e || ''));
+    safeUnlink(snapshotPath);
+    return;
+  }
+  safeUnlink(snapshotPath);
+
+  const rawItems = Array.isArray(data.items) ? data.items : [];
+  const dedup = new Map();
+  for (const it of rawItems) {
+    const id = String(it.listingId || '').trim();
+    if (!id) continue;
+    if (!dedup.has(id)) dedup.set(id, it);
+  }
+  const list = [...dedup.values()];
+  const ids = [...dedup.keys()];
+
+  let rowState = null;
+  try {
+    rowState = await supabaseFetchWbAutoparseState(chatId);
+  } catch (_) {
+    rowState = null;
+  }
+  const baselineReady = Boolean(rowState?.baseline_ready);
+
+  if (!baselineReady) {
+    try {
+      await supabaseInsertWbSeenBatch(chatId, ids);
+      await supabaseUpsertWbAutoparseState(chatId, { baseline_ready: true });
+    } catch (e) {
+      console.error('WB baseline seed error:', String(e?.message || e || ''));
+    }
+    return;
+  }
+
+  let seen = new Set();
+  try {
+    seen = await supabaseFetchWbSeenIdsSet(chatId);
+  } catch (e) {
+    console.error('WB seen fetch error:', String(e?.message || e || ''));
+  }
+
+  const fresh = list.filter((it) => !seen.has(String(it.listingId || '').trim()));
+  const maxNotify = 30;
+  const newIdsAll = fresh.map((it) => String(it.listingId).trim()).filter(Boolean);
+
+  for (let i = 0; i < Math.min(fresh.length, maxNotify); i += 1) {
+    const it = fresh[i];
+    const title = String(it.title || 'Без названия').slice(0, 400);
+    const price = String(it.priceText || '—').slice(0, 120);
+    const href = String(it.href || '').trim() || '—';
+    const msg = `🆕 Новое на Wildberries\n\n📱 ${title}\n💰 ${price}\n🔗 ${href}`;
+    try {
+      await sendMessage(chatId, msg, mainKeyboard);
+    } catch (e) {
+      console.error('WB notify send error:', String(e?.message || e || ''));
+    }
+    await sleep(350);
+  }
+
+  if (newIdsAll.length) {
+    try {
+      await supabaseInsertWbSeenBatch(chatId, newIdsAll);
+    } catch (e) {
+      console.error('WB seen insert error:', String(e?.message || e || ''));
+    }
+  }
+}
+
+async function runParserForMarketplace({
+  chatId,
+  marketplace,
+  parserOverrides = null,
+  silent = false,
+  wbSnapshotPath = null,
+  wbAutoparseHook = null,
+}) {
   if (isParsing) {
-    await sendMessage(chatId, 'Парсинг уже запущен. Подождите, пожалуйста.');
+    if (!silent) await sendMessage(chatId, 'Парсинг уже запущен. Подождите, пожалуйста.');
     return;
   }
 
@@ -686,7 +1025,7 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
 
   const state = getUserState(chatId);
   const settings = state.settings;
-  state.stage = 'parsing';
+  state.stage = silent ? 'main' : 'parsing';
 
   const stopKeyboard = buildStopKeyboard();
   let stage1Sent = false;
@@ -696,28 +1035,33 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
   const beforeFiles = listExcelFilesOnServer();
   const beforePaths = new Set(beforeFiles.map((f) => f.filePath));
 
-  await sendMessage(chatId, `🟢 Парсинг запущен: ${marketplace === 'avito' ? 'Авито' : 'ВБ'}.\nНажми «${STOP_PARSING_TEXT}».`, stopKeyboard);
+  if (!silent) {
+    await sendMessage(
+      chatId,
+      `🟢 Парсинг запущен: ${marketplace === 'avito' ? 'Авито' : 'ВБ'}.\nНажми «${STOP_PARSING_TEXT}».`,
+      stopKeyboard
+    );
+  }
 
-  // Run main.js directly so we can stop it and stream stdout/stderr.
+  const env = buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides });
+  if (wbSnapshotPath && marketplace === 'wb') {
+    env.PARSER_WB_SNAPSHOT_JSON = wbSnapshotPath;
+  }
+
   const child = spawn('node', ['main.js'], {
     cwd: PROJECT_DIR,
-    env: buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides }),
+    env,
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
   });
 
   activeChildByChatId.set(chatId, child);
 
-  function extractResultsFile(line) {
-    const m = line && line.match(/(results_[^\s]+\.xlsx)/i);
-    return m ? m[1] : null;
-  }
-
   function handleParserLine(line) {
+    if (silent) return;
     const s = String(line || '').trimEnd();
     if (!s) return;
 
-    // В Telegram отправляем только 3 этапа, подробные строки остаются в terminal/journalctl.
     if (!stage3Emitted && !stage1Sent && (s.includes('Адрес поиска') || s.includes('Переход на') || s.includes('Открываю страницу'))) {
       stage1Sent = true;
       sendMessage(chatId, '🌐 Захожу на страницу', stopKeyboard).catch(() => {});
@@ -767,6 +1111,18 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
     state.stage = 'main';
     const stopped = Boolean(stopRequestedByChatId.get(chatId));
     stopRequestedByChatId.delete(chatId);
+
+    if (wbAutoparseHook && marketplace === 'wb') {
+      try {
+        await wbAutoparseHook(code, stopped);
+      } catch (e) {
+        console.error('wbAutoparseHook error:', String(e?.message || e || ''));
+      }
+      isParsing = false;
+      lastRunMarketplace = null;
+      return;
+    }
+
     if (stopped) {
       try {
         await sendMessage(chatId, '⛔ Парсинг остановлен.', mainKeyboard);
@@ -781,7 +1137,6 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
     try {
       const afterFiles = listExcelFilesOnServer();
       const newOnes = afterFiles.filter((f) => !beforePaths.has(f.filePath));
-      // store excel metadata to DB (best-effort)
       if (SUPABASE_URL && SUPABASE_ANON_KEY && newOnes.length > 0) {
         for (const f of newOnes) {
           try {
@@ -814,6 +1169,102 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
       lastRunMarketplace = null;
     }
   });
+}
+
+let wbAutoparseTickBusy = false;
+
+async function tickWbAutoparseScheduler() {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
+  if (isParsing || wbAutoparseTickBusy) return;
+  let due;
+  try {
+    due = await supabaseFetchDueWbAutoparseUsers();
+  } catch (e) {
+    console.error('tickWbAutoparseScheduler list:', String(e?.message || e || ''));
+    return;
+  }
+  if (!due.length) return;
+
+  const job = due[0];
+  const chatId = Number(job.telegram_user_id);
+  if (!Number.isFinite(chatId)) return;
+
+  wbAutoparseTickBusy = true;
+  try {
+    const rows = await supabaseFetchMarketSettingsAll(chatId).catch(() => []);
+    const wbRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'wb');
+    if (!wbRow) {
+      await supabaseUpsertWbAutoparseState(chatId, {
+        next_scheduled_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+      });
+      return;
+    }
+
+    const s = mapRowToMarketSettings(wbRow);
+    const fp = wbSettingsFingerprintFromDraft({
+      query: s.query,
+      extraKeywords: s.extraKeywords,
+      minPrice: s.minPrice,
+      maxPrice: s.maxPrice,
+      memory: s.memory,
+      color: s.color,
+    });
+
+    const st = await supabaseFetchWbAutoparseState(chatId).catch(() => null);
+    if (st && st.settings_fingerprint && st.settings_fingerprint !== fp) {
+      await supabaseDeleteWbSeenListings(chatId);
+      await supabaseUpsertWbAutoparseState(chatId, {
+        baseline_ready: false,
+        settings_fingerprint: fp,
+      });
+    } else if (!st?.settings_fingerprint) {
+      await supabaseUpsertWbAutoparseState(chatId, { settings_fingerprint: fp });
+    }
+
+    const snapshotPath = path.join(PROJECT_DIR, `.wb_snap_${chatId}_${Date.now()}.json`);
+    const intervalMinutes = Number(job.interval_minutes) > 0 ? Number(job.interval_minutes) : 30;
+
+    await supabaseUpsertWbAutoparseState(chatId, {
+      is_running: true,
+      last_run_started_at: new Date().toISOString(),
+      settings_fingerprint: fp,
+    });
+
+    const parserOverrides = {
+      marketplace: 'wb',
+      query: s.query || 'iPhone',
+      extraKeywords: s.extraKeywords || '',
+      city: '',
+      minPrice: s.minPrice || 0,
+      maxPrice: s.maxPrice || 0,
+      memory: s.memory || '',
+      onlyToday: false,
+      color: s.color || '',
+    };
+
+    await runParserForMarketplace({
+      chatId,
+      marketplace: 'wb',
+      parserOverrides,
+      silent: true,
+      wbSnapshotPath: snapshotPath,
+      wbAutoparseHook: async (exitCode, stopped) => {
+        await processWbAutoparseResult(chatId, exitCode, snapshotPath, intervalMinutes, stopped);
+      },
+    });
+  } catch (e) {
+    console.error('tickWbAutoparseScheduler run:', String(e?.message || e || ''));
+    try {
+      await supabaseUpsertWbAutoparseState(chatId, {
+        is_running: false,
+        next_scheduled_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+      });
+    } catch (_) {
+      /* ignore */
+    }
+  } finally {
+    wbAutoparseTickBusy = false;
+  }
 }
 
 async function syncExcelFilesToDb(chatId) {
@@ -882,14 +1333,20 @@ async function handleMessage(msg) {
   const state = getUserState(chatId);
 
   if (text === WIZARD_CANCEL) {
-    state.stage = 'main';
+    const backAuto = state.returnToAutoMenu;
+    state.stage = backAuto ? 'auto_wb_menu' : 'main';
     state.runDraft = null;
     state.configureOnly = false;
     state.selectedMarketplaceForRun = null;
     state.selectedMarketplace = null;
     state.launchMode = false;
     state.excelDeleteCandidates = [];
-    await sendMessage(chatId, '❌ Отменено. Возврат в главное меню.', mainKeyboard);
+    state.returnToAutoMenu = false;
+    await sendMessage(
+      chatId,
+      '❌ Отменено.',
+      backAuto ? buildAutoWbMenuKeyboard() : mainKeyboard
+    );
     return;
   }
 
@@ -958,27 +1415,199 @@ async function handleMessage(msg) {
   }
 
   if (text === MENU.autoSettings) {
+    state.stage = 'auto_wb_menu';
+    await sendMessage(
+      chatId,
+      '⚙️ *Автопарсинг Wildberries*\n\n' +
+        'Фильтры задаются отдельно от Авито. Первый запуск сохраняет базу объявлений (уведомлений нет), далее приходят только *новые* позиции.\n\n' +
+        'Выберите действие:',
+      buildAutoWbMenuKeyboard(),
+      'Markdown'
+    );
+    return;
+  }
+
+  if (text === MENU.checkAutoparse) {
+    try {
+      const st = await supabaseFetchWbAutoparseState(msg.from?.id);
+      const runningDb = Boolean(st?.is_running);
+      const runningLocal = isParsing && lastRunMarketplace === 'wb';
+      const running = runningDb || runningLocal;
+      const fmt = (iso) => {
+        if (!iso) return '—';
+        try {
+          return new Date(iso).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
+        } catch (_) {
+          return String(iso);
+        }
+      };
+      let lines = ['🔎 *Статус автопарсинга ВБ*\n'];
+      if (running) {
+        lines.push('⏳ Сейчас выполняется парсинг Wildberries.');
+      } else {
+        lines.push('✅ Сейчас парсинг не выполняется.');
+      }
+      if (st) {
+        lines.push(`\n⏱ Интервал: ${st.interval_minutes || 30} мин`);
+        lines.push(st.enabled === false ? '\n⏸ Расписание: *выключено*' : '\n▶️ Расписание: *включено*');
+        lines.push(`\n🕐 Последний старт: ${fmt(st.last_run_started_at)}`);
+        const okTag =
+          st.last_run_ok === false ? ' (с ошибкой)' : st.last_run_ok === true ? ' (успех)' : '';
+        lines.push(`\n🕔 Последнее завершение: ${fmt(st.last_run_finished_at)}${okTag}`);
+        lines.push(`\n📅 Следующий запуск (по плану): ${fmt(st.next_scheduled_at)}`);
+        lines.push(`\n📚 База для сравнения: ${st.baseline_ready ? 'готова' : 'ещё не создана (первый прогон)'}`);
+      } else {
+        lines.push('\nВ БД ещё нет записи расписания. Откройте «Настроить периодичность».');
+      }
+      await sendMessage(chatId, lines.join(''), mainKeyboard, 'Markdown');
+    } catch (e) {
+      await sendMessage(chatId, `⚠️ Не удалось прочитать статус: ${String(e?.message || e || '')}`, mainKeyboard);
+    }
+    return;
+  }
+
+  if (text === MENU.avitoParams) {
     try {
       const rows = await supabaseFetchMarketSettingsAll(msg.from?.id);
       const avitoRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'avito');
-      const wbRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'wb');
       state.marketSettings.avito = avitoRow ? mapRowToMarketSettings(avitoRow) : null;
-      state.marketSettings.wb = wbRow ? mapRowToMarketSettings(wbRow) : null;
-
+      const current = state.marketSettings.avito;
+      state.configureOnly = true;
+      state.returnToAutoMenu = false;
+      state.runDraft = {
+        marketplace: 'avito',
+        query: current?.query || 'iPhone',
+        extraKeywords: current?.extraKeywords || '',
+        city: current?.city || 'moskva',
+        minPrice: Number(current?.minPrice || 0),
+        maxPrice: Number(current?.maxPrice || 0),
+        memory: current?.memory || '',
+        onlyToday: Boolean(current?.onlyToday),
+        color: current?.color || '',
+      };
+      state.stage = 'run_query';
       await sendMessage(
         chatId,
-        `⚙️ Ваши настройки площадок:\n\n` +
-          `${formatMarketSettingsBlock('🛒 Настройки Авито', state.marketSettings.avito)}\n\n` +
-          `${formatWbSettingsBlock('🛍️ Настройки ВБ', state.marketSettings.wb)}`,
-        {
-          keyboard: [[{ text: SETTINGS_AVITO }, { text: SETTINGS_WB }], [{ text: MENU.backToMenu }]],
-          resize_keyboard: true,
-          one_time_keyboard: false,
-        }
+        '🛒 *Параметры Авито* (для ручного запуска). Шаг 1/8: название поиска:',
+        skipKeyboard(),
+        'Markdown'
       );
     } catch (e) {
-      await sendMessage(chatId, `⚠️ Ошибка чтения настроек: ${String(e?.message || e || '')}`, mainKeyboard);
+      await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, mainKeyboard);
     }
+    return;
+  }
+
+  if (state.stage === 'auto_wb_menu') {
+    if (text === MENU.backToMenu) {
+      state.stage = 'main';
+      await sendMessage(chatId, '⬅️ Главное меню.', mainKeyboard);
+      return;
+    }
+    if (text === AUTO_WB_FILTERS) {
+      try {
+        const rows = await supabaseFetchMarketSettingsAll(msg.from?.id);
+        const wbRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'wb');
+        state.marketSettings.wb = wbRow ? mapRowToMarketSettings(wbRow) : null;
+        const current = state.marketSettings.wb;
+        state.configureOnly = true;
+        state.returnToAutoMenu = true;
+        state.runDraft = {
+          marketplace: 'wb',
+          query: current?.query || 'iPhone',
+          extraKeywords: current?.extraKeywords || '',
+          city: current?.city || 'moskva',
+          minPrice: Number(current?.minPrice || 0),
+          maxPrice: Number(current?.maxPrice || 0),
+          memory: current?.memory || '',
+          onlyToday: Boolean(current?.onlyToday),
+          color: current?.color || '',
+        };
+        state.stage = 'run_query';
+        await sendMessage(
+          chatId,
+          '🔧 *Фильтры ВБ* — шаг 1/7: введите название поиска (например iPhone):',
+          skipKeyboard(),
+          'Markdown'
+        );
+        return;
+      } catch (e) {
+        await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoWbMenuKeyboard());
+        return;
+      }
+    }
+    if (text === AUTO_WB_INTERVAL) {
+      try {
+        const st = await supabaseFetchWbAutoparseState(msg.from?.id);
+        state.stage = 'wb_auto_interval';
+        await sendMessage(
+          chatId,
+          '⏱ *Периодичность* — как часто после завершения парсинга ждать следующий запуск.\n\n' +
+            'Выберите интервал или включите/выключите автозапуск.\n' +
+            'Текущее: ' +
+            (st ? `${st.interval_minutes || 30} мин, ${st.enabled === false ? 'ВЫКЛ' : 'ВКЛ'}` : 'по умолчанию 30 мин'),
+          buildWbIntervalKeyboard(st),
+          'Markdown'
+        );
+        return;
+      } catch (e) {
+        await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoWbMenuKeyboard());
+        return;
+      }
+    }
+    await sendMessage(chatId, '👇 Выберите пункт меню автопарсинга.', buildAutoWbMenuKeyboard());
+    return;
+  }
+
+  if (state.stage === 'wb_auto_interval') {
+    if (text === MENU.backToMenu) {
+      state.stage = 'auto_wb_menu';
+      await sendMessage(chatId, '⬅️ Назад.', buildAutoWbMenuKeyboard());
+      return;
+    }
+    const intervalMap = {
+      '10 мин': 10,
+      '15 мин': 15,
+      '30 мин': 30,
+      '45 мин': 45,
+      '60 мин': 60,
+    };
+    try {
+      if (text === AUTO_WB_ENABLED) {
+        await supabaseUpsertWbAutoparseState(msg.from?.id, {
+          enabled: true,
+          next_scheduled_at: new Date().toISOString(),
+        });
+        const st = await supabaseFetchWbAutoparseState(msg.from?.id);
+        await sendMessage(chatId, '✅ Автопарсинг *включён*. Первый слот — с ближайшей минуты.', buildWbIntervalKeyboard(st), 'Markdown');
+        return;
+      }
+      if (text === AUTO_WB_DISABLED) {
+        await supabaseUpsertWbAutoparseState(msg.from?.id, { enabled: false });
+        const st = await supabaseFetchWbAutoparseState(msg.from?.id);
+        await sendMessage(chatId, '⏸ Автопарсинг *выключен*. Расписание не запускается.', buildWbIntervalKeyboard(st), 'Markdown');
+        return;
+      }
+      const mins = intervalMap[text];
+      if (mins) {
+        await supabaseUpsertWbAutoparseState(msg.from?.id, {
+          interval_minutes: mins,
+          next_scheduled_at: new Date().toISOString(),
+        });
+        const st = await supabaseFetchWbAutoparseState(msg.from?.id);
+        await sendMessage(
+          chatId,
+          `✅ Интервал сохранён: *${mins} мин*. Следующая проверка запланирована.`,
+          buildWbIntervalKeyboard(st),
+          'Markdown'
+        );
+        return;
+      }
+    } catch (e) {
+      await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildWbIntervalKeyboard({}));
+      return;
+    }
+    await sendMessage(chatId, 'Выберите интервал кнопкой.', buildWbIntervalKeyboard(await supabaseFetchWbAutoparseState(msg.from?.id)));
     return;
   }
 
@@ -987,20 +1616,22 @@ async function handleMessage(msg) {
     await sendMessage(
       chatId,
       '📘 *Инструкция*\n\n' +
-        '1️⃣ Нажми _⚙️ Настройки автопарсинга_ и заполни параметры отдельно для _🛒 Авито_ и _🛍️ ВБ_.\n\n' +
-        '2️⃣ Нажми _🚀 Ручной запуск_ → выбери площадку → выбери режим:\n\n' +
+        '1️⃣ _⚙️ Настройки автопарсинга_ — только *Wildberries*: «Настроить фильтры» и «Настроить периодичность». Первый автозапуск сохраняет базу объявлений (без уведомлений), дальше приходят только *новые*.\n\n' +
+        '2️⃣ _🛒 Параметры Авито_ — сохранённые фильтры для ручного запуска (автопарсинг только у ВБ).\n\n' +
+        '3️⃣ _🔎 Проверить автопарсинг_ — статус и время следующего автообхода ВБ.\n\n' +
+        '4️⃣ _🚀 Ручной запуск_ → площадка → режим:\n\n' +
         '    • _▶️ Продолжить с настройками автопарсинга_\n' +
         '    • _✍️ Задать вручную_\n\n' +
-        '3️⃣ На любом шаге мастера можно нажать _❌ Отмена_ — ничего не сохранится, бот вернёт в главное меню.\n\n' +
-        '4️⃣ Во время парсинга бот пишет этапы:\n\n' +
+        '5️⃣ На шагах мастера: _❌ Отмена_ — без сохранения (из автопарсинга ВБ вернёт в его меню).\n\n' +
+        '6️⃣ При *ручном* парсинге бот пишет этапы:\n\n' +
         '    • 🌐 Захожу на страницу\n' +
         '    • ✅ Страница открыта, собираю данные\n' +
         '    • ✅ Парсинг завершен, ваш файл сохранен\n\n' +
-        '5️⃣ В разделе _📁 Эксель файлы_ есть 2 действия:\n\n' +
-        '    • _👀 Посмотреть_ — список и отправка файлов в чат\n' +
-        '    • _🗑 Удалить_ — удаление выбранного файла с сервера и из БД\n\n' +
+        '7️⃣ _📁 Эксель файлы_:\n\n' +
+        '    • _👀 Посмотреть_ — отправка файлов\n' +
+        '    • _🗑 Удалить_ — с сервера и из БД\n\n' +
         '────────────\n\n' +
-        '🩹 Во время парсинга можно нажать _⛔ Остановить парсинг_.',
+        '🩹 При ручном парсинге: _⛔ Остановить парсинг_.',
       mainKeyboard,
       'Markdown'
     );
@@ -1381,6 +2012,34 @@ async function handleMessage(msg) {
       state.stage = 'main';
       if (state.configureOnly) {
         state.configureOnly = false;
+        const backAuto = state.returnToAutoMenu;
+        state.returnToAutoMenu = false;
+        if (backAuto && d.marketplace === 'wb') {
+          try {
+            const prev = await supabaseFetchWbAutoparseState(msg.from?.id);
+            const fp = wbSettingsFingerprintFromDraft(d);
+            const fpChanged = Boolean(prev?.settings_fingerprint && prev.settings_fingerprint !== fp);
+            if (fpChanged) {
+              await supabaseDeleteWbSeenListings(msg.from?.id);
+            }
+            await supabaseUpsertWbAutoparseState(msg.from?.id, {
+              settings_fingerprint: fp,
+              baseline_ready: fpChanged ? false : Boolean(prev?.baseline_ready),
+              interval_minutes: prev?.interval_minutes > 0 ? prev.interval_minutes : 30,
+              enabled: prev == null ? true : prev.enabled !== false,
+              next_scheduled_at: new Date().toISOString(),
+            });
+          } catch (e) {
+            console.error('wb_autoparse on filter save:', String(e?.message || e || ''));
+          }
+          state.stage = 'auto_wb_menu';
+          await sendMessage(
+            chatId,
+            '✅ Фильтры Wildberries сохранены в БД.\n\nЕсли фильтры изменились — база сравнения сброшена; первый прогон снова создаст базу без уведомлений.',
+            buildAutoWbMenuKeyboard()
+          );
+          return;
+        }
         await sendMessage(
           chatId,
           `✅ Настройки ${d.marketplace === 'wb' ? 'ВБ' : 'Авито'} сохранены в БД.`,
@@ -1411,6 +2070,14 @@ async function handleMessage(msg) {
       return;
     }
     if (text === MENU.backToMenu) {
+      if (state.returnToAutoMenu) {
+        state.returnToAutoMenu = false;
+        state.runDraft = null;
+        state.configureOnly = false;
+        state.stage = 'auto_wb_menu';
+        await sendMessage(chatId, '⬅️ Назад в меню автопарсинга.', buildAutoWbMenuKeyboard());
+        return;
+      }
       state.stage = 'main';
       state.runDraft = null;
       state.configureOnly = false;
@@ -1563,6 +2230,10 @@ async function handleMessage(msg) {
 
 async function pollLoop() {
   console.log('Telegram-бот запущен.');
+  await supabaseResetAllWbAutoparseRunning();
+  setInterval(() => {
+    tickWbAutoparseScheduler().catch((e) => console.error('tickWbAutoparseScheduler:', String(e?.message || e || '')));
+  }, 60_000);
   let backoffMs = 1200;
   while (running) {
     try {

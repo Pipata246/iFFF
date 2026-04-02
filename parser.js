@@ -2,6 +2,7 @@
  * Сбор URL поиска Avito, парсинг карточек, фильтрация, Excel (xlsx).
  */
 
+const fs = require('fs');
 const XLSX = require('xlsx');
 const { cityToSlug, parsePriceNumber, dedupeByHref, resultsPath, logSuccess } = require('./utils');
 
@@ -725,6 +726,39 @@ function saveToExcel(rows, meta) {
   }
   const fp = resultsPath();
   XLSX.writeFile(wb, fp);
+  const snapPath = process.env.PARSER_WB_SNAPSHOT_JSON && String(process.env.PARSER_WB_SNAPSHOT_JSON).trim();
+  if (snapPath) {
+    try {
+      const wbOnly = sheetRows.filter((row) => {
+        const pl = String(row.Площадка || '');
+        const link = String(row.Ссылка || '');
+        return /wildberries/i.test(pl) || /wildberries\.ru/i.test(link);
+      });
+      const items = wbOnly.map((row) => {
+        const href = String(row.Ссылка || '').trim();
+        let listingId = '';
+        try {
+          const m = href.match(/\/catalog\/(\d+)/i);
+          listingId = m ? m[1] : href.slice(0, 240);
+        } catch (_) {
+          listingId = href.slice(0, 240);
+        }
+        return {
+          listingId,
+          title: String(row.Название || '').trim(),
+          priceText: String(row.Цена || '').trim(),
+          href,
+        };
+      });
+      fs.writeFileSync(
+        snapPath,
+        JSON.stringify({ generatedAt: new Date().toISOString(), items }, null, 0),
+        'utf8'
+      );
+    } catch (e) {
+      console.error('WB snapshot JSON:', String(e && e.message ? e.message : e));
+    }
+  }
   if (m.checkpoint) {
     logSuccess(`промежуточно — ${m.checkpoint}: ${fp}, строк: ${sheetRows.length}`);
   } else {
