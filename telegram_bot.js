@@ -584,6 +584,11 @@ function buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides =
   const o = parserOverrides || {};
   const runMarketplace = o.marketplace || marketplace;
   const isWbOnly = runMarketplace === 'wb';
+  const queryRaw = (o.query != null ? String(o.query) : process.env.PARSER_QUERY || 'iPhone 15').trim();
+  const extraRaw = (o.extraKeywords != null ? String(o.extraKeywords) : process.env.PARSER_EXTRA_KEYWORDS || '').trim();
+  const wbCombinedQuery = isWbOnly
+    ? [queryRaw, extraRaw].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim()
+    : queryRaw;
   // main.js переключаем в env mode (без readline)
   return {
     ...process.env,
@@ -598,8 +603,9 @@ function buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides =
     PLAYWRIGHT_HEADLESS: '1',
     // Keep memory stable on 1GB RAM VPS
     NODE_OPTIONS: process.env.NODE_OPTIONS || '--max-old-space-size=384',
-    PARSER_QUERY: o.query != null ? String(o.query) : process.env.PARSER_QUERY || 'iPhone 15',
-    PARSER_EXTRA_KEYWORDS: o.extraKeywords != null ? String(o.extraKeywords) : process.env.PARSER_EXTRA_KEYWORDS || '',
+    // Для WB модель должна гарантированно быть в поисковой строке URL.
+    PARSER_QUERY: wbCombinedQuery || 'iPhone',
+    PARSER_EXTRA_KEYWORDS: isWbOnly ? '' : extraRaw,
     PARSER_CITY: isWbOnly ? '' : o.city != null ? String(o.city) : process.env.PARSER_CITY || 'moskva',
     PARSER_MIN_PRICE: o.minPrice != null ? String(o.minPrice) : settings.priceFilterEnabled ? String(settings.minPrice) : '0',
     PARSER_MAX_PRICE: o.maxPrice != null ? String(o.maxPrice) : settings.priceFilterEnabled ? String(settings.maxPrice) : '0',
