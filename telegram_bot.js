@@ -419,12 +419,10 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
   state.stage = 'parsing';
 
   const stopKeyboard = buildStopKeyboard();
-  const mainLogKeywords = ['Шаг', 'ОБНАРУЖЕН БЛОК', 'ПОВТОР', 'УСПЕХ', 'Файл результатов'];
   let stage1Sent = false;
   let stage2Sent = false;
   let stage3Sent = false;
-  let lastLogSendAt = 0;
-  const logTail = [];
+  let stage3Emitted = false;
 
   const beforeFiles = listExcelFilesOnServer();
   const beforePaths = new Set(beforeFiles.map((f) => f.filePath));
@@ -446,37 +444,25 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
     return m ? m[1] : null;
   }
 
-  async function maybeSendLogs(force = false) {
-    const now = Date.now();
-    if (!force && now - lastLogSendAt < 8000) return;
-    lastLogSendAt = now;
-    const slice = logTail.slice(-20);
-    if (!slice.length) return;
-    await sendMessage(chatId, `Логи (последние):\n${slice.join('\n')}`, stopKeyboard);
-  }
-
   function handleParserLine(line) {
     const s = String(line || '').trimEnd();
     if (!s) return;
 
-    const important = mainLogKeywords.some((k) => s.includes(k));
-    if (important) {
-      logTail.push(s);
-      if (logTail.length > 80) logTail.splice(0, logTail.length - 80);
-    }
-
-    if (!stage1Sent && s.includes('Шаг 1') && s.includes('Запуск браузера')) {
+    // Prevent "late" stage messages after the result was already emitted.
+    if (!stage3Emitted && !stage1Sent && (s.includes('Адрес поиска') || s.includes('Переход на') || s.includes('Открываю страницу'))) {
       stage1Sent = true;
       sendMessage(chatId, '1) Открываю страницу', stopKeyboard).catch(() => {});
     }
 
     if (
+      !stage3Emitted &&
       !stage2Sent &&
-      (s.includes('Шаг 5') ||
-        s.includes('Парсинг страницы выдачи') ||
+      (s.includes('Парсинг страницы выдачи') ||
         s.includes('Ожидание карточек') ||
         s.includes('Карточки товаров') ||
-        s.includes('Скролл ленты'))
+        s.includes('Скролл ленты') ||
+        s.includes('Парсинг страницы выдачи') ||
+        s.includes('Парсинг карточек'))
     ) {
       stage2Sent = true;
       sendMessage(chatId, '2) Страница открыта, начинаю парсинг', stopKeyboard).catch(() => {});
@@ -484,15 +470,12 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
 
     if (!stage3Sent && s.includes('Файл результатов')) {
       stage3Sent = true;
+      stage3Emitted = true;
       const resultsFile = extractResultsFile(s);
       const msg = resultsFile
         ? `3) Парсинг завершен, ваш файл сохранен: ${resultsFile}`
         : '3) Парсинг завершен, ваш файл сохранен';
       sendMessage(chatId, msg, stopKeyboard).catch(() => {});
-      maybeSendLogs(true).catch(() => {});
-    } else if (important && (s.includes('Шаг') || s.includes('ОБНАРУЖЕН БЛОК') || s.includes('ПОВТОР'))) {
-      // occasionally push log chunk
-      maybeSendLogs(false).catch(() => {});
     }
   }
 
