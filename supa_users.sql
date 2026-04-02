@@ -12,39 +12,24 @@ create table if not exists public.users (
 
 alter table public.users enable row level security;
 
--- Anonymous role still needs basic privileges besides RLS policies
+-- Recreate policies (safe rerun)
+drop policy if exists anon_insert_users on public.users;
+drop policy if exists anon_update_users on public.users;
+
+-- Ensure anon can insert/update (required alongside RLS policies)
 grant insert, update on public.users to anon;
 
--- Allow anonymous inserts (bot uses anon key from server)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1
-    FROM pg_policies
-    WHERE schemaname = 'public'
-      AND tablename = 'users'
-      AND policyname = 'anon_insert_users'
-  ) THEN
-    CREATE POLICY anon_insert_users
-      ON public.users
-      FOR INSERT
-      TO anon
-      WITH CHECK (telegram_user_id IS NOT NULL);
-  END IF;
+-- Allow anonymous inserts/updates when telegram_user_id is present
+create policy anon_insert_users
+  on public.users
+  for insert
+  to anon
+  with check (telegram_user_id is not null);
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM pg_policies
-    WHERE schemaname = 'public'
-      AND tablename = 'users'
-      AND policyname = 'anon_update_users'
-  ) THEN
-    CREATE POLICY anon_update_users
-      ON public.users
-      FOR UPDATE
-      TO anon
-      USING (telegram_user_id IS NOT NULL)
-      WITH CHECK (telegram_user_id IS NOT NULL);
-  END IF;
-END $$;
+create policy anon_update_users
+  on public.users
+  for update
+  to anon
+  using (telegram_user_id is not null)
+  with check (telegram_user_id is not null);
 
