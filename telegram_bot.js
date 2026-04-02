@@ -637,6 +637,8 @@ function buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides =
     PARSER_MARKETPLACE: runMarketplace,
     // Always run unattended (no manual proxy prompts) for VPS bot runs
     AVITO_MANUAL_PROXY: '0',
+    // На части VPS прокси стабильнее при установке на уровне launch.
+    AVITO_PROXY_ON_LAUNCH: '1',
     AVITO_WAIT_ENTER: '0',
     // Ensure no WB home warmup (avoid going to WB home)
     WB_USE_HOME_WARMUP: '0',

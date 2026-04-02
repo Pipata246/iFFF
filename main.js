@@ -651,11 +651,46 @@ async function confirmAvitoBlockAfterSoftWait(page, pageLabel) {
   await randomDelay(2_500, 6_000);
   const blocked = await detectBlock(page);
   if (blocked) {
+    // На экране "Доступ ограничен" Avito иногда даёт кнопку "Продолжить".
+    // Пробуем пройти этот шаг до ухода в IP-ротацию.
+    const recovered = await tryPassAvitoContinueChallenge(page, pageLabel);
+    if (recovered) {
+      const cntRecovered = await page.locator(ITEM_SELECTOR).count().catch(() => 0);
+      log(`  [${pageLabel}] после нажатия "Продолжить" блок ушёл, карточек в DOM: ${cntRecovered}`);
+      return false;
+    }
     logBlock(`[${pageLabel}] блок/капча подтверждён после мягкой перепроверки`);
     return true;
   }
   const cnt = await page.locator(ITEM_SELECTOR).count().catch(() => 0);
   log(`  [${pageLabel}] блок не подтвердился после ожидания; карточек в DOM сейчас: ${cnt}`);
+  return false;
+}
+
+/**
+ * Пробуем пройти промежуточный экран Avito "Продолжить".
+ * @param {import('playwright').Page} page
+ * @param {string} pageLabel
+ * @returns {Promise<boolean>} true => блок ушёл
+ */
+async function tryPassAvitoContinueChallenge(page, pageLabel) {
+  for (let i = 0; i < 2; i++) {
+    let clicked = false;
+    try {
+      const btn = page.getByRole('button', { name: /продолжить|continue/i }).first();
+      if (await btn.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await btn.click({ timeout: 8000 });
+        clicked = true;
+      }
+    } catch (_) {
+      clicked = false;
+    }
+    if (!clicked) break;
+    log(`  [${pageLabel}] нажали кнопку "Продолжить" (${i + 1}/2), ждём повторную проверку страницы…`);
+    await page.waitForLoadState('load', { timeout: 45_000 }).catch(() => {});
+    await randomDelay(10_000, 18_000);
+    if (!(await detectBlock(page))) return true;
+  }
   return false;
 }
 
