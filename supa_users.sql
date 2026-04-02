@@ -12,6 +12,9 @@ create table if not exists public.users (
 
 alter table public.users enable row level security;
 
+-- Anonymous role still needs basic privileges besides RLS policies
+grant insert, update on public.users to anon;
+
 -- Allow anonymous inserts (bot uses anon key from server)
 DO $$
 BEGIN

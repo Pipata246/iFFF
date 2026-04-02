@@ -133,6 +133,7 @@ async function handleMessage(msg) {
         console.warn('Supabase insert skipped: missing SUPABASE_URL and/or SUPABASE_ANON_KEY');
       }
       if (SUPABASE_URL && SUPABASE_ANON_KEY && tgUserId) {
+        console.log('Supabase insert attempt:', tgUserId);
         const payload = [
           {
             telegram_user_id: tgUserId,
@@ -156,6 +157,7 @@ async function handleMessage(msg) {
           const txt = await resp.text().catch(() => '');
           throw new Error(`Supabase HTTP ${resp.status}: ${txt || '(empty body)'}`);
         }
+        console.log('Supabase insert OK:', tgUserId);
       }
     } catch (err) {
       console.error('Supabase insert error:', String(err?.message || err || ''));
