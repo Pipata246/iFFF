@@ -504,6 +504,20 @@ function formatMarketSettingsBlock(title, s) {
   );
 }
 
+function formatWbSettingsBlock(title, s) {
+  if (!s) {
+    return `${title}:\nтут пока что пусто`;
+  }
+  return (
+    `${title}:\n` +
+    `1) Запрос: ${s.query || '—'}\n` +
+    `2) Модель: ${s.extraKeywords || '—'}\n` +
+    `3) Цена: ${s.minPrice || 0} - ${s.maxPrice || 0}\n` +
+    `4) Память: ${s.memory || '—'}\n` +
+    `5) Цвет: ${s.color || '—'}`
+  );
+}
+
 async function supabaseUpsertExcelFile({ telegramUserId, fileName, filePath, marketplace }) {
   const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
   if (!hasSupabaseCfg) return;
@@ -517,7 +531,7 @@ async function supabaseUpsertExcelFile({ telegramUserId, fileName, filePath, mar
     },
   ];
 
-  const resp = await fetch(`${SUPABASE_URL}/rest/v1/excel_files`, {
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/excel_files?on_conflict=file_path`, {
     method: 'POST',
     headers: {
       apikey: SUPABASE_ANON_KEY,
@@ -528,6 +542,7 @@ async function supabaseUpsertExcelFile({ telegramUserId, fileName, filePath, mar
   });
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '');
+    if (resp.status === 409) return;
     throw new Error(`Supabase excel_files upsert failed: HTTP ${resp.status}: ${txt}`);
   }
 }
@@ -539,11 +554,13 @@ const stopRequestedByChatId = new Map(); // chatId -> boolean
 
 function buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides = null }) {
   const o = parserOverrides || {};
+  const runMarketplace = o.marketplace || marketplace;
+  const isWbOnly = runMarketplace === 'wb';
   // main.js переключаем в env mode (без readline)
   return {
     ...process.env,
     PARSER_USE_ENV: '1',
-    PARSER_MARKETPLACE: o.marketplace || marketplace,
+    PARSER_MARKETPLACE: runMarketplace,
     // Always run unattended (no manual proxy prompts) for VPS bot runs
     AVITO_MANUAL_PROXY: '0',
     AVITO_WAIT_ENTER: '0',
@@ -555,13 +572,21 @@ function buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides =
     NODE_OPTIONS: process.env.NODE_OPTIONS || '--max-old-space-size=384',
     PARSER_QUERY: o.query != null ? String(o.query) : process.env.PARSER_QUERY || 'iPhone 15',
     PARSER_EXTRA_KEYWORDS: o.extraKeywords != null ? String(o.extraKeywords) : process.env.PARSER_EXTRA_KEYWORDS || '',
-    PARSER_CITY: o.city != null ? String(o.city) : process.env.PARSER_CITY || 'moskva',
+    PARSER_CITY: isWbOnly ? '' : o.city != null ? String(o.city) : process.env.PARSER_CITY || 'moskva',
     PARSER_MIN_PRICE: o.minPrice != null ? String(o.minPrice) : settings.priceFilterEnabled ? String(settings.minPrice) : '0',
     PARSER_MAX_PRICE: o.maxPrice != null ? String(o.maxPrice) : settings.priceFilterEnabled ? String(settings.maxPrice) : '0',
     PARSER_MEMORY: o.memory != null ? String(o.memory) : settings.memoryFilterEnabled ? String(settings.memoryGb) : '',
     PARSER_SELLER_TYPE: settings.sellerType || 'any',
     PARSER_MIN_RATING: String(settings.minRating || 0),
-    PARSER_ONLY_TODAY: o.onlyToday != null ? (o.onlyToday ? '1' : '0') : settings.onlyToday ? '1' : '0',
+    PARSER_ONLY_TODAY: isWbOnly
+      ? '0'
+      : o.onlyToday != null
+        ? o.onlyToday
+          ? '1'
+          : '0'
+        : settings.onlyToday
+          ? '1'
+          : '0',
     PARSER_COLOR:
       o.color != null
         ? String(o.color)
@@ -819,7 +844,7 @@ async function handleMessage(msg) {
         chatId,
         `⚙️ Ваши настройки площадок:\n\n` +
           `${formatMarketSettingsBlock('🛒 Настройки Авито', state.marketSettings.avito)}\n\n` +
-          `${formatMarketSettingsBlock('🛍️ Настройки ВБ', state.marketSettings.wb)}`,
+          `${formatWbSettingsBlock('🛍️ Настройки ВБ', state.marketSettings.wb)}`,
         {
           keyboard: [[{ text: SETTINGS_AVITO }, { text: SETTINGS_WB }], [{ text: MENU.backToMenu }]],
           resize_keyboard: true,
@@ -871,6 +896,13 @@ async function handleMessage(msg) {
       (files.length > 30 ? `\n... и ещё ${files.length - 30}` : '');
 
     await sendMessage(chatId, listText, mainKeyboard);
+    try {
+      const latest = files[0];
+      await sendDocument(chatId, latest.filePath, `📎 Файл: ${latest.fileName}`);
+    } catch (e) {
+      console.error('Send excel document error:', String(e?.message || e || ''));
+      await sendMessage(chatId, '⚠️ Не удалось отправить файл в Telegram, но он сохранен на сервере.', mainKeyboard);
+    }
     return;
   }
 
