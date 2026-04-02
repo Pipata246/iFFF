@@ -48,14 +48,14 @@ let offset = Number(process.env.TELEGRAM_BOT_OFFSET || 0);
 let running = true;
 
 const MENU = {
-  manualRun: 'Ручной запуск',
-  autoSettings: 'Настройки автопарсинга',
-  guide: 'Инструкция',
-  excels: 'Эксель файлы',
-  backToMenu: 'Назад в меню',
+  manualRun: '🚀 Ручной запуск',
+  autoSettings: '⚙️ Настройки автопарсинга',
+  guide: '📘 Инструкция',
+  excels: '📁 Эксель файлы',
+  backToMenu: '⬅️ Назад в меню',
 };
 
-const STOP_PARSING_TEXT = 'Остановить парсинг';
+const STOP_PARSING_TEXT = '⛔ Остановить парсинг';
 
 function buildStopKeyboard() {
   return {
@@ -85,6 +85,15 @@ const yesNoKeyboard = (yesText, noText) => ({
   resize_keyboard: true,
   one_time_keyboard: false,
 });
+
+const WIZARD_YES = '✅ Да';
+const WIZARD_NO = '❌ Нет';
+const WIZARD_SKIP = '⏭️ Пропустить';
+const WIZARD_START = '🚀 Запустить парсинг';
+
+function wizardYesNoKeyboard() {
+  return yesNoKeyboard(WIZARD_YES, WIZARD_NO);
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -164,6 +173,7 @@ function getUserState(chatId) {
         minRating: 0,
       },
       stage: 'main', // main | choosing_market | settings_only_today | settings_price | settings_memory | settings_color
+      runDraft: null,
     });
   }
   return userStateByChatId.get(chatId);
@@ -172,7 +182,7 @@ function getUserState(chatId) {
 function buildMarketplaceKeyboard() {
   // EXACTLY 2 buttons as requested
   return {
-    keyboard: [[{ text: 'Авито' }, { text: 'ВБ' }]],
+    keyboard: [[{ text: '🛒 Авито' }, { text: '🛍️ ВБ' }]],
     resize_keyboard: true,
     one_time_keyboard: false,
   };
@@ -359,12 +369,13 @@ let lastRunMarketplace = null;
 const activeChildByChatId = new Map(); // chatId -> child process
 const stopRequestedByChatId = new Map(); // chatId -> boolean
 
-function buildParserEnvForRun({ chatId, marketplace, settings }) {
+function buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides = null }) {
+  const o = parserOverrides || {};
   // main.js переключаем в env mode (без readline)
   return {
     ...process.env,
     PARSER_USE_ENV: '1',
-    PARSER_MARKETPLACE: marketplace,
+    PARSER_MARKETPLACE: o.marketplace || marketplace,
     // Always run unattended (no manual proxy prompts) for VPS bot runs
     AVITO_MANUAL_PROXY: '0',
     AVITO_WAIT_ENTER: '0',
@@ -374,20 +385,27 @@ function buildParserEnvForRun({ chatId, marketplace, settings }) {
     PLAYWRIGHT_HEADLESS: '1',
     // Keep memory stable on 1GB RAM VPS
     NODE_OPTIONS: process.env.NODE_OPTIONS || '--max-old-space-size=384',
-    PARSER_QUERY: process.env.PARSER_QUERY || 'iPhone 15',
-    PARSER_EXTRA_KEYWORDS: process.env.PARSER_EXTRA_KEYWORDS || '',
+    PARSER_QUERY: o.query != null ? String(o.query) : process.env.PARSER_QUERY || 'iPhone 15',
+    PARSER_EXTRA_KEYWORDS: o.extraKeywords != null ? String(o.extraKeywords) : process.env.PARSER_EXTRA_KEYWORDS || '',
     PARSER_CITY: process.env.PARSER_CITY || 'moskva',
-    PARSER_MIN_PRICE: settings.priceFilterEnabled ? String(settings.minPrice) : '0',
-    PARSER_MAX_PRICE: settings.priceFilterEnabled ? String(settings.maxPrice) : '0',
-    PARSER_MEMORY: settings.memoryFilterEnabled ? String(settings.memoryGb) : '',
+    PARSER_MIN_PRICE: o.minPrice != null ? String(o.minPrice) : settings.priceFilterEnabled ? String(settings.minPrice) : '0',
+    PARSER_MAX_PRICE: o.maxPrice != null ? String(o.maxPrice) : settings.priceFilterEnabled ? String(settings.maxPrice) : '0',
+    PARSER_MEMORY: o.memory != null ? String(o.memory) : settings.memoryFilterEnabled ? String(settings.memoryGb) : '',
     PARSER_SELLER_TYPE: settings.sellerType || 'any',
     PARSER_MIN_RATING: String(settings.minRating || 0),
-    PARSER_ONLY_TODAY: settings.onlyToday ? '1' : '0',
-    PARSER_COLOR: marketplace === 'wb' || marketplace === 'both' ? settings.colorFilterEnabled ? settings.color : '' : '',
+    PARSER_ONLY_TODAY: o.onlyToday != null ? (o.onlyToday ? '1' : '0') : settings.onlyToday ? '1' : '0',
+    PARSER_COLOR:
+      o.color != null
+        ? String(o.color)
+        : marketplace === 'wb' || marketplace === 'both'
+          ? settings.colorFilterEnabled
+            ? settings.color
+            : ''
+          : '',
   };
 }
 
-async function runParserForMarketplace({ chatId, marketplace }) {
+async function runParserForMarketplace({ chatId, marketplace, parserOverrides = null }) {
   if (isParsing) {
     await sendMessage(chatId, 'Парсинг уже запущен. Подождите, пожалуйста.');
     return;
@@ -411,18 +429,12 @@ async function runParserForMarketplace({ chatId, marketplace }) {
   const beforeFiles = listExcelFilesOnServer();
   const beforePaths = new Set(beforeFiles.map((f) => f.filePath));
 
-  await sendMessage(
-    chatId,
-    `Парсинг запущен: ${marketplace === 'avito' ? 'Авито' : 'ВБ'}.\nНажми кнопку «${STOP_PARSING_TEXT}», чтобы остановить.`,
-    stopKeyboard
-  );
-
-  const env = buildParserEnvForRun({ chatId, marketplace, settings });
+  await sendMessage(chatId, `🟢 Парсинг запущен: ${marketplace === 'avito' ? 'Авито' : 'ВБ'}.\nНажми «${STOP_PARSING_TEXT}».`, stopKeyboard);
 
   // Run main.js directly so we can stop it and stream stdout/stderr.
   const child = spawn('node', ['main.js'], {
     cwd: PROJECT_DIR,
-    env,
+    env: buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides }),
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
   });
@@ -638,7 +650,8 @@ async function handleMessage(msg) {
   // Main menu buttons
   if (text === MENU.manualRun) {
     state.stage = 'choosing_market';
-    await sendMessage(chatId, 'Выберите площадку:', buildMarketplaceKeyboard());
+    state.runDraft = null;
+    await sendMessage(chatId, '🚀 Выберите площадку для ручного запуска:', buildMarketplaceKeyboard());
     return;
   }
 
@@ -646,11 +659,7 @@ async function handleMessage(msg) {
     state.stage = 'settings';
     state.launchMode = false;
     state.selectedMarketplace = null;
-    await sendMessage(
-      chatId,
-      'Настройки автопарсинга. Нажимай кнопки ДА/НЕТ и значения.',
-      buildSettingsKeyboard(state.settings, { launchMode: false })
-    );
+    await sendMessage(chatId, '⚙️ Настройки автопарсинга. Нажимай кнопки ДА/НЕТ и значения.', buildSettingsKeyboard(state.settings, { launchMode: false }));
     return;
   }
 
@@ -698,30 +707,152 @@ async function handleMessage(msg) {
 
   // Stage: choosing marketplace
   if (state.stage === 'choosing_market') {
-    if (text === 'Авито') {
-      state.selectedMarketplace = 'avito';
-      state.launchMode = true;
-      state.stage = 'settings';
-      await sendMessage(
-        chatId,
-        'Настройки парсинга для Авито. Выбери фильтры и нажми `Запустить парсинг`.',
-        buildSettingsKeyboard(state.settings, { launchMode: true })
-      );
+    if (text === '🛒 Авито' || text === 'Авито') {
+      state.runDraft = {
+        marketplace: 'avito',
+        query: '',
+        extraKeywords: '',
+        minPrice: 0,
+        maxPrice: 0,
+        memory: '',
+        onlyToday: false,
+        color: '',
+      };
+      state.stage = 'run_query';
+      await sendMessage(chatId, '📝 Шаг 1/7: Введите название поиска (например: iPhone):', { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
       return;
     }
-    if (text === 'ВБ') {
-      state.selectedMarketplace = 'wb';
-      state.launchMode = true;
-      state.stage = 'settings';
-      await sendMessage(
-        chatId,
-        'Настройки парсинга для ВБ. Выбери фильтры и нажми `Запустить парсинг`.',
-        buildSettingsKeyboard(state.settings, { launchMode: true })
-      );
+    if (text === '🛍️ ВБ' || text === 'ВБ') {
+      state.runDraft = {
+        marketplace: 'wb',
+        query: '',
+        extraKeywords: '',
+        minPrice: 0,
+        maxPrice: 0,
+        memory: '',
+        onlyToday: false,
+        color: '',
+      };
+      state.stage = 'run_query';
+      await sendMessage(chatId, '📝 Шаг 1/7: Введите название поиска (например: iPhone):', { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
       return;
     }
-    // ignore other texts in this stage
-    await sendMessage(chatId, 'Выбери: Авито или ВБ.', buildMarketplaceKeyboard());
+    await sendMessage(chatId, '👇 Выбери площадку кнопкой снизу.', buildMarketplaceKeyboard());
+    return;
+  }
+
+  if (state.stage === 'run_query') {
+    state.runDraft.query = text === WIZARD_SKIP ? 'iPhone' : text;
+    state.stage = 'run_model';
+    await sendMessage(chatId, '📝 Шаг 2/7: Введите модель (например: 15 Pro Max) или пропустите:', { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
+    return;
+  }
+
+  if (state.stage === 'run_model') {
+    state.runDraft.extraKeywords = text === WIZARD_SKIP ? '' : text;
+    state.stage = 'run_min_price';
+    await sendMessage(chatId, '💰 Шаг 3/7: Цена ОТ (только число) или 0:', { keyboard: [[{ text: '0' }]], resize_keyboard: true, one_time_keyboard: false });
+    return;
+  }
+
+  if (state.stage === 'run_min_price') {
+    const v = parseInt(String(text).replace(/\D/g, ''), 10);
+    state.runDraft.minPrice = Number.isFinite(v) ? v : 0;
+    state.stage = 'run_max_price';
+    await sendMessage(chatId, '💰 Шаг 4/7: Цена ДО (только число) или 0:', { keyboard: [[{ text: '0' }]], resize_keyboard: true, one_time_keyboard: false });
+    return;
+  }
+
+  if (state.stage === 'run_max_price') {
+    const v = parseInt(String(text).replace(/\D/g, ''), 10);
+    state.runDraft.maxPrice = Number.isFinite(v) ? v : 0;
+    state.stage = 'run_memory_enable';
+    await sendMessage(chatId, '💾 Шаг 5/7: Фильтровать по памяти?', wizardYesNoKeyboard());
+    return;
+  }
+
+  if (state.stage === 'run_memory_enable') {
+    if (text === WIZARD_YES) {
+      state.stage = 'run_memory_value';
+      await sendMessage(chatId, '💾 Выберите память:', buildMemoryKeyboard());
+      return;
+    }
+    state.runDraft.memory = '';
+    state.stage = state.runDraft.marketplace === 'avito' ? 'run_only_today' : 'run_color_enable';
+    await sendMessage(
+      chatId,
+      state.runDraft.marketplace === 'avito' ? '📆 Шаг 6/7: Только за сегодня?' : '🎨 Шаг 6/7: Фильтровать по цвету?',
+      wizardYesNoKeyboard()
+    );
+    return;
+  }
+
+  if (state.stage === 'run_memory_value') {
+    if (text === '128' || text === '256' || text === '512') state.runDraft.memory = text;
+    else if (text === '1ТБ') state.runDraft.memory = '1024';
+    else state.runDraft.memory = '';
+    state.stage = state.runDraft.marketplace === 'avito' ? 'run_only_today' : 'run_color_enable';
+    await sendMessage(
+      chatId,
+      state.runDraft.marketplace === 'avito' ? '📆 Шаг 6/7: Только за сегодня?' : '🎨 Шаг 6/7: Фильтровать по цвету?',
+      wizardYesNoKeyboard()
+    );
+    return;
+  }
+
+  if (state.stage === 'run_only_today') {
+    state.runDraft.onlyToday = text === WIZARD_YES;
+    state.stage = 'run_confirm';
+    await sendMessage(chatId, '✅ Шаг 7/7: Запустить парсинг с этими настройками?', { keyboard: [[{ text: WIZARD_START }, { text: MENU.backToMenu }]], resize_keyboard: true, one_time_keyboard: false });
+    return;
+  }
+
+  if (state.stage === 'run_color_enable') {
+    if (text === WIZARD_YES) {
+      state.stage = 'run_color_value';
+      await sendMessage(chatId, '🎨 Выберите цвет:', buildColorKeyboard());
+      return;
+    }
+    state.runDraft.color = '';
+    state.stage = 'run_confirm';
+    await sendMessage(chatId, '✅ Шаг 7/7: Запустить парсинг с этими настройками?', { keyboard: [[{ text: WIZARD_START }, { text: MENU.backToMenu }]], resize_keyboard: true, one_time_keyboard: false });
+    return;
+  }
+
+  if (state.stage === 'run_color_value') {
+    state.runDraft.color = COLOR_BUTTONS.includes(text) ? text : '';
+    state.stage = 'run_confirm';
+    await sendMessage(chatId, '✅ Шаг 7/7: Запустить парсинг с этими настройками?', { keyboard: [[{ text: WIZARD_START }, { text: MENU.backToMenu }]], resize_keyboard: true, one_time_keyboard: false });
+    return;
+  }
+
+  if (state.stage === 'run_confirm') {
+    if (text === WIZARD_START) {
+      const d = state.runDraft || {};
+      state.stage = 'main';
+      await runParserForMarketplace({
+        chatId,
+        marketplace: d.marketplace || 'avito',
+        parserOverrides: {
+          marketplace: d.marketplace || 'avito',
+          query: d.query || 'iPhone',
+          extraKeywords: d.extraKeywords || '',
+          minPrice: d.minPrice || 0,
+          maxPrice: d.maxPrice || 0,
+          memory: d.memory || '',
+          onlyToday: Boolean(d.onlyToday),
+          color: d.color || '',
+        },
+      });
+      return;
+    }
+    if (text === MENU.backToMenu) {
+      state.stage = 'main';
+      state.runDraft = null;
+      await sendMessage(chatId, '⬅️ Возврат в меню.', mainKeyboard);
+      return;
+    }
+    await sendMessage(chatId, 'Нажми `Запустить парсинг` или `Назад`.', { keyboard: [[{ text: WIZARD_START }, { text: MENU.backToMenu }]], resize_keyboard: true, one_time_keyboard: false });
     return;
   }
 
