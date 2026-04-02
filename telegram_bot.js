@@ -97,6 +97,8 @@ const SETTINGS_WB = '🛍️ Настроить ВБ';
 const SETTINGS_SAVE = '💾 Сохранить настройки';
 const RUN_CONTINUE_AUTO = '▶️ Продолжить с настройками автопарсинга';
 const RUN_SET_MANUAL = '✍️ Задать вручную';
+const EXCEL_VIEW = '👀 Посмотреть';
+const EXCEL_DELETE = '🗑 Удалить';
 
 function wizardYesNoKeyboard() {
   return {
@@ -218,6 +220,7 @@ function getUserState(chatId) {
       runDraft: null,
       configureOnly: false,
       selectedMarketplaceForRun: null,
+      excelDeleteCandidates: [],
       marketSettings: {
         avito: null,
         wb: null,
@@ -275,6 +278,24 @@ function buildMemoryKeyboard() {
       [{ text: 'Любая' }],
       [{ text: WIZARD_CANCEL }],
     ],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
+}
+
+function buildExcelMenuKeyboard() {
+  return {
+    keyboard: [[{ text: EXCEL_VIEW }, { text: EXCEL_DELETE }], [{ text: MENU.backToMenu }]],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
+}
+
+function buildExcelDeleteKeyboard(files) {
+  const rows = files.map((f) => [{ text: f.fileName }]);
+  rows.push([{ text: MENU.backToMenu }]);
+  return {
+    keyboard: rows,
     resize_keyboard: true,
     one_time_keyboard: false,
   };
@@ -575,6 +596,26 @@ async function supabaseUpsertExcelFile({ telegramUserId, fileName, filePath, mar
   }
 }
 
+async function supabaseDeleteExcelFileByPath(filePath) {
+  const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  if (!hasSupabaseCfg || !filePath) return;
+  const qs = new URLSearchParams({
+    file_path: `eq.${filePath}`,
+  });
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/excel_files?${qs.toString()}`, {
+    method: 'DELETE',
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      'content-type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`Supabase excel_files delete failed: HTTP ${resp.status}: ${txt}`);
+  }
+}
+
 let isParsing = false;
 let lastRunMarketplace = null;
 const activeChildByChatId = new Map(); // chatId -> child process
@@ -642,17 +683,6 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
   lastRunMarketplace = marketplace;
 
   const state = getUserState(chatId);
-
-  if (text === WIZARD_CANCEL) {
-    state.stage = 'main';
-    state.runDraft = null;
-    state.configureOnly = false;
-    state.selectedMarketplaceForRun = null;
-    state.selectedMarketplace = null;
-    state.launchMode = false;
-    await sendMessage(chatId, '❌ Отменено. Возврат в главное меню.', mainKeyboard);
-    return;
-  }
   const settings = state.settings;
   state.stage = 'parsing';
 
@@ -805,6 +835,42 @@ async function syncExcelFilesToDb(chatId) {
   }
 }
 
+async function sendExcelFilesToChat(chatId) {
+  const files = listExcelFilesOnServer();
+  if (!files.length) {
+    await sendMessage(chatId, 'Excel-файлов пока нет. Запусти парсинг и потом нажми `Эксель файлы`.', mainKeyboard);
+    return;
+  }
+
+  await syncExcelFilesToDb(chatId);
+
+  const listText =
+    'На сервере найдено Excel файлов: \n' +
+    files
+      .slice(0, 30)
+      .map((f) => `• ${f.fileName} (${formatBytes(f.sizeBytes)})`)
+      .join('\n') +
+    (files.length > 30 ? `\n... и ещё ${files.length - 30}` : '');
+
+  await sendMessage(chatId, listText, mainKeyboard);
+  const toSend = files.slice(0, 30);
+  let sent = 0;
+  for (const f of toSend) {
+    try {
+      await sendDocument(chatId, f.filePath, `📎 Файл: ${f.fileName}`);
+      sent += 1;
+      await sleep(250);
+    } catch (e) {
+      console.error('Send excel document error:', String(e?.message || e || ''));
+    }
+  }
+  if (sent === 0) {
+    await sendMessage(chatId, '⚠️ Не удалось отправить файлы в Telegram, но они сохранены на сервере.', mainKeyboard);
+  } else if (files.length > toSend.length) {
+    await sendMessage(chatId, `ℹ️ Отправил ${toSend.length} файлов. Остальные можно получить следующим запросом.`, mainKeyboard);
+  }
+}
+
 async function handleMessage(msg) {
   if (!msg || !msg.chat || typeof msg.chat.id !== 'number') return;
   const chatId = msg.chat.id;
@@ -812,6 +878,18 @@ async function handleMessage(msg) {
   if (!text) return;
 
   const state = getUserState(chatId);
+
+  if (text === WIZARD_CANCEL) {
+    state.stage = 'main';
+    state.runDraft = null;
+    state.configureOnly = false;
+    state.selectedMarketplaceForRun = null;
+    state.selectedMarketplace = null;
+    state.launchMode = false;
+    state.excelDeleteCandidates = [];
+    await sendMessage(chatId, '❌ Отменено. Возврат в главное меню.', mainKeyboard);
+    return;
+  }
 
   // Stop parsing button (while parser is running)
   if (state.stage === 'parsing' && text === STOP_PARSING_TEXT) {
@@ -907,13 +985,18 @@ async function handleMessage(msg) {
     await sendMessage(
       chatId,
       '📘 *Инструкция*\n\n' +
-        '1️⃣ Нажми _⚙️ Настройки автопарсинга_ и заполни параметры.\n' +
-        '2️⃣ Нажми _🚀 Ручной запуск_ и выбери площадку _🛒 Авито_ или _🛍️ ВБ_.\n' +
-        '3️⃣ Дождись этапов парсинга:\n' +
-        '   • 🌐 Открываю страницу\n' +
-        '   • ✅ Страница открыта, начинаю парсинг\n' +
-        '   • 📁 Парсинг завершен, файл сохранен\n' +
-        '4️⃣ Нажми _📁 Эксель файлы_, чтобы увидеть список файлов на сервере.\n\n' +
+        '1️⃣ Нажми _⚙️ Настройки автопарсинга_ и заполни параметры отдельно для _🛒 Авито_ и _🛍️ ВБ_.\n' +
+        '2️⃣ Нажми _🚀 Ручной запуск_ → выбери площадку → выбери режим:\n' +
+        '   • _▶️ Продолжить с настройками автопарсинга_\n' +
+        '   • _✍️ Задать вручную_\n' +
+        '3️⃣ На любом шаге мастера можно нажать _❌ Отмена_ — ничего не сохранится, бот вернет в главное меню.\n' +
+        '4️⃣ Во время парсинга бот пишет этапы:\n' +
+        '   • 🌐 Захожу на страницу\n' +
+        '   • ✅ Страница открыта, собираю данные\n' +
+        '   • ✅ Парсинг завершен, ваш файл сохранен\n' +
+        '5️⃣ В разделе _📁 Эксель файлы_ есть 2 действия:\n' +
+        '   • _👀 Посмотреть_ — список и отправка файлов в чат\n' +
+        '   • _🗑 Удалить_ — удаление выбранного файла с сервера и из БД\n\n' +
         '🧷 Во время парсинга можно нажать _⛔ Остановить парсинг_.',
       mainKeyboard,
       'Markdown'
@@ -922,41 +1005,74 @@ async function handleMessage(msg) {
   }
 
   if (text === MENU.excels) {
-    state.stage = 'main';
-    const files = listExcelFilesOnServer();
-    if (!files.length) {
-      await sendMessage(chatId, 'Excel-файлов пока нет. Запусти парсинг и потом нажми `Эксель файлы`.', mainKeyboard);
+    state.stage = 'excel_menu';
+    await sendMessage(chatId, '📁 Раздел Excel файлов. Выберите действие:', buildExcelMenuKeyboard());
+    return;
+  }
+
+  if (state.stage === 'excel_menu') {
+    if (text === EXCEL_VIEW) {
+      state.stage = 'main';
+      await sendExcelFilesToChat(chatId);
       return;
     }
-
-    // best-effort sync to DB
-    await syncExcelFilesToDb(chatId);
-
-    const listText =
-      'На сервере найдено Excel файлов: \n' +
-      files
-        .slice(0, 30)
-        .map((f) => `• ${f.fileName} (${formatBytes(f.sizeBytes)})`)
-        .join('\n') +
-      (files.length > 30 ? `\n... и ещё ${files.length - 30}` : '');
-
-    await sendMessage(chatId, listText, mainKeyboard);
-    const toSend = files.slice(0, 30);
-    let sent = 0;
-    for (const f of toSend) {
-      try {
-        await sendDocument(chatId, f.filePath, `📎 Файл: ${f.fileName}`);
-        sent += 1;
-        await sleep(250);
-      } catch (e) {
-        console.error('Send excel document error:', String(e?.message || e || ''));
+    if (text === EXCEL_DELETE) {
+      const files = listExcelFilesOnServer();
+      if (!files.length) {
+        state.stage = 'main';
+        await sendMessage(chatId, 'Excel-файлов для удаления нет.', mainKeyboard);
+        return;
       }
+      state.stage = 'excel_delete_pick';
+      state.excelDeleteCandidates = files.map((f) => f.fileName);
+      await sendMessage(chatId, '🗑 Выберите файл для удаления:', buildExcelDeleteKeyboard(files));
+      return;
     }
-    if (sent === 0) {
-      await sendMessage(chatId, '⚠️ Не удалось отправить файлы в Telegram, но они сохранены на сервере.', mainKeyboard);
-    } else if (files.length > toSend.length) {
-      await sendMessage(chatId, `ℹ️ Отправил ${toSend.length} файлов. Остальные можно получить следующим запросом.`, mainKeyboard);
+    if (text === MENU.backToMenu) {
+      state.stage = 'main';
+      await sendMessage(chatId, '⬅️ Возврат в меню.', mainKeyboard);
+      return;
     }
+    await sendMessage(chatId, '👇 Выберите действие кнопкой снизу.', buildExcelMenuKeyboard());
+    return;
+  }
+
+  if (state.stage === 'excel_delete_pick') {
+    if (text === MENU.backToMenu) {
+      state.stage = 'main';
+      state.excelDeleteCandidates = [];
+      await sendMessage(chatId, '⬅️ Возврат в меню.', mainKeyboard);
+      return;
+    }
+    const fileName = String(text || '').trim();
+    const currentFiles = listExcelFilesOnServer();
+    const target = currentFiles.find((f) => f.fileName === fileName);
+    if (!target) {
+      await sendMessage(chatId, '⚠️ Такой файл не найден. Выберите файл кнопкой из списка.', buildExcelDeleteKeyboard(currentFiles));
+      return;
+    }
+    try {
+      if (fs.existsSync(target.filePath)) {
+        fs.unlinkSync(target.filePath);
+      }
+    } catch (e) {
+      await sendMessage(chatId, `⚠️ Не удалось удалить файл с сервера: ${String(e?.message || e || '')}`, buildExcelDeleteKeyboard(currentFiles));
+      return;
+    }
+    try {
+      await supabaseDeleteExcelFileByPath(target.filePath);
+    } catch (e) {
+      console.error('Excel DB delete error:', String(e?.message || e || ''));
+    }
+    const after = listExcelFilesOnServer();
+    if (!after.length) {
+      state.stage = 'main';
+      state.excelDeleteCandidates = [];
+      await sendMessage(chatId, `✅ Файл удален: ${target.fileName}\nБольше файлов не осталось.`, mainKeyboard);
+      return;
+    }
+    state.excelDeleteCandidates = after.map((f) => f.fileName);
+    await sendMessage(chatId, `✅ Файл удален: ${target.fileName}\nВыберите следующий файл для удаления:`, buildExcelDeleteKeyboard(after));
     return;
   }
 
