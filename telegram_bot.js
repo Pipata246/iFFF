@@ -128,6 +128,10 @@ async function handleMessage(msg) {
     try {
       const from = msg.from;
       const tgUserId = from && from.id != null ? String(from.id) : '';
+      const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+      if (!hasSupabaseCfg) {
+        console.warn('Supabase insert skipped: missing SUPABASE_URL and/or SUPABASE_ANON_KEY');
+      }
       if (SUPABASE_URL && SUPABASE_ANON_KEY && tgUserId) {
         const payload = [
           {
