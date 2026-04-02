@@ -430,7 +430,7 @@ async function runParserForMarketplace({ chatId, marketplace }) {
   activeChildByChatId.set(chatId, child);
 
   function extractResultsFile(line) {
-    const m = line && line.match(/(results_[0-9A-Za-z_\\-:TZ.]+\\.xlsx)/i);
+    const m = line && line.match(/(results_[^\s]+\.xlsx)/i);
     return m ? m[1] : null;
   }
 
