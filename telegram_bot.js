@@ -587,9 +587,12 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
   state.stage = 'parsing';
 
   const stopKeyboard = buildStopKeyboard();
-  let stage1Sent = false;
-  let stage2Sent = false;
   let stage3Emitted = false;
+  // By default, stream detailed parser logs to Telegram (close to terminal output).
+  const sendDetailedLogs = process.env.TELEGRAM_PARSER_DETAILED_LOGS === '0' ? false : true;
+  const logQueue = [];
+  let logFlushTimer = null;
+  let logFlushInProgress = false;
 
   const beforeFiles = listExcelFilesOnServer();
   const beforePaths = new Set(beforeFiles.map((f) => f.filePath));
@@ -611,28 +614,55 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
     return m ? m[1] : null;
   }
 
+  async function flushLogQueue() {
+    if (logFlushInProgress) return;
+    if (!logQueue.length) return;
+    logFlushInProgress = true;
+    try {
+      // Telegram limit ~4096 chars; keep margin for stability.
+      while (logQueue.length > 0) {
+        let chunk = '';
+        while (logQueue.length > 0) {
+          const next = logQueue[0];
+          const candidate = chunk ? `${chunk}\n${next}` : next;
+          if (candidate.length > 3500) break;
+          chunk = candidate;
+          logQueue.shift();
+        }
+        if (chunk) {
+          await sendMessage(chatId, chunk, stopKeyboard);
+          await sleep(250);
+        } else {
+          // Emergency path for a single overlong line
+          const one = String(logQueue.shift() || '');
+          const part = one.slice(0, 3400);
+          await sendMessage(chatId, part, stopKeyboard);
+          await sleep(250);
+          if (one.length > 3400) logQueue.unshift(one.slice(3400));
+        }
+      }
+    } catch (_) {
+      // keep bot alive even if Telegram temporarily fails
+    } finally {
+      logFlushInProgress = false;
+    }
+  }
+
+  function scheduleLogFlush() {
+    if (logFlushTimer) return;
+    logFlushTimer = setTimeout(async () => {
+      logFlushTimer = null;
+      await flushLogQueue();
+    }, 800);
+  }
+
   function handleParserLine(line) {
     const s = String(line || '').trimEnd();
     if (!s) return;
 
-    // Prevent "late" stage messages after the result was already emitted.
-    if (!stage3Emitted && !stage1Sent && (s.includes('Адрес поиска') || s.includes('Переход на') || s.includes('Открываю страницу'))) {
-      stage1Sent = true;
-      sendMessage(chatId, '1) 🌐 Открываю страницу', stopKeyboard).catch(() => {});
-    }
-
-    if (
-      !stage3Emitted &&
-      !stage2Sent &&
-      (s.includes('Парсинг страницы выдачи') ||
-        s.includes('Ожидание карточек') ||
-        s.includes('Карточки товаров') ||
-        s.includes('Скролл ленты') ||
-        s.includes('Парсинг страницы выдачи') ||
-        s.includes('Парсинг карточек'))
-    ) {
-      stage2Sent = true;
-      sendMessage(chatId, '2) ✅ Страница открыта, начинаю парсинг', stopKeyboard).catch(() => {});
+    if (sendDetailedLogs && !stage3Emitted) {
+      logQueue.push(s);
+      scheduleLogFlush();
     }
   }
 
@@ -678,6 +708,11 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
       return;
     }
     try {
+      if (logFlushTimer) {
+        clearTimeout(logFlushTimer);
+        logFlushTimer = null;
+      }
+      await flushLogQueue();
       const afterFiles = listExcelFilesOnServer();
       const newOnes = afterFiles.filter((f) => !beforePaths.has(f.filePath));
       // store excel metadata to DB (best-effort)
