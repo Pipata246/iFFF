@@ -13,17 +13,35 @@ create table if not exists public.users (
 alter table public.users enable row level security;
 
 -- Allow anonymous inserts (bot uses anon key from server)
-create policy if not exists "anon_insert_users"
-on public.users
-for insert
-to anon
-with check (telegram_user_id is not null);
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_policies
+    WHERE schemaname = 'public'
+      AND tablename = 'users'
+      AND policyname = 'anon_insert_users'
+  ) THEN
+    CREATE POLICY anon_insert_users
+      ON public.users
+      FOR INSERT
+      TO anon
+      WITH CHECK (telegram_user_id IS NOT NULL);
+  END IF;
 
--- Allow updates needed for "resolution=merge-duplicates"
-create policy if not exists "anon_update_users"
-on public.users
-for update
-to anon
-using (telegram_user_id is not null)
-with check (telegram_user_id is not null);
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_policies
+    WHERE schemaname = 'public'
+      AND tablename = 'users'
+      AND policyname = 'anon_update_users'
+  ) THEN
+    CREATE POLICY anon_update_users
+      ON public.users
+      FOR UPDATE
+      TO anon
+      USING (telegram_user_id IS NOT NULL)
+      WITH CHECK (telegram_user_id IS NOT NULL);
+  END IF;
+END $$;
 
