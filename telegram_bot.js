@@ -89,6 +89,7 @@ const yesNoKeyboard = (yesText, noText) => ({
 const WIZARD_YES = '✅ Да';
 const WIZARD_NO = '❌ Нет';
 const WIZARD_SKIP = '⏭️ Пропустить';
+const WIZARD_CANCEL = '❌ Отмена';
 const WIZARD_START = '🚀 Запустить парсинг';
 const SETTINGS_EDIT = '✏️ Изменить настройки';
 const SETTINGS_AVITO = '🛒 Настроить Авито';
@@ -98,12 +99,32 @@ const RUN_CONTINUE_AUTO = '▶️ Продолжить с настройками
 const RUN_SET_MANUAL = '✍️ Задать вручную';
 
 function wizardYesNoKeyboard() {
-  return yesNoKeyboard(WIZARD_YES, WIZARD_NO);
+  return {
+    keyboard: [[{ text: WIZARD_YES }, { text: WIZARD_NO }], [{ text: WIZARD_CANCEL }]],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
 }
 
 function confirmKeyboard(configureOnly) {
   return {
-    keyboard: [[{ text: configureOnly ? SETTINGS_SAVE : WIZARD_START }, { text: MENU.backToMenu }]],
+    keyboard: [[{ text: configureOnly ? SETTINGS_SAVE : WIZARD_START }], [{ text: WIZARD_CANCEL }]],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
+}
+
+function skipKeyboard() {
+  return {
+    keyboard: [[{ text: WIZARD_SKIP }], [{ text: WIZARD_CANCEL }]],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
+}
+
+function numberKeyboard(v = '0') {
+  return {
+    keyboard: [[{ text: String(v) }], [{ text: WIZARD_CANCEL }]],
     resize_keyboard: true,
     one_time_keyboard: false,
   };
@@ -242,6 +263,7 @@ function buildColorKeyboard() {
   }
   // add "без фильтра" at the end
   rows.push([{ text: 'Без фильтра' }]);
+  rows.push([{ text: WIZARD_CANCEL }]);
   return { keyboard: rows, resize_keyboard: true, one_time_keyboard: false };
 }
 
@@ -251,6 +273,7 @@ function buildMemoryKeyboard() {
       [{ text: '128' }, { text: '256' }],
       [{ text: '512' }, { text: '1ТБ' }],
       [{ text: 'Любая' }],
+      [{ text: WIZARD_CANCEL }],
     ],
     resize_keyboard: true,
     one_time_keyboard: false,
@@ -294,6 +317,7 @@ function buildSettingsKeyboard(settings, opts = {}) {
       [{ text: memYes }, { text: memNo }],
       [{ text: colorYes }, { text: colorNo }],
       lastRow,
+      [{ text: WIZARD_CANCEL }],
     ],
     resize_keyboard: true,
     one_time_keyboard: false,
@@ -612,6 +636,17 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
   lastRunMarketplace = marketplace;
 
   const state = getUserState(chatId);
+
+  if (text === WIZARD_CANCEL) {
+    state.stage = 'main';
+    state.runDraft = null;
+    state.configureOnly = false;
+    state.selectedMarketplaceForRun = null;
+    state.selectedMarketplace = null;
+    state.launchMode = false;
+    await sendMessage(chatId, '❌ Отменено. Возврат в главное меню.', mainKeyboard);
+    return;
+  }
   const settings = state.settings;
   state.stage = 'parsing';
 
@@ -900,12 +935,21 @@ async function handleMessage(msg) {
       (files.length > 30 ? `\n... и ещё ${files.length - 30}` : '');
 
     await sendMessage(chatId, listText, mainKeyboard);
-    try {
-      const latest = files[0];
-      await sendDocument(chatId, latest.filePath, `📎 Файл: ${latest.fileName}`);
-    } catch (e) {
-      console.error('Send excel document error:', String(e?.message || e || ''));
-      await sendMessage(chatId, '⚠️ Не удалось отправить файл в Telegram, но он сохранен на сервере.', mainKeyboard);
+    const toSend = files.slice(0, 30);
+    let sent = 0;
+    for (const f of toSend) {
+      try {
+        await sendDocument(chatId, f.filePath, `📎 Файл: ${f.fileName}`);
+        sent += 1;
+        await sleep(250);
+      } catch (e) {
+        console.error('Send excel document error:', String(e?.message || e || ''));
+      }
+    }
+    if (sent === 0) {
+      await sendMessage(chatId, '⚠️ Не удалось отправить файлы в Telegram, но они сохранены на сервере.', mainKeyboard);
+    } else if (files.length > toSend.length) {
+      await sendMessage(chatId, `ℹ️ Отправил ${toSend.length} файлов. Остальные можно получить следующим запросом.`, mainKeyboard);
     }
     return;
   }
@@ -926,7 +970,11 @@ async function handleMessage(msg) {
       color: current?.color || '',
     };
     state.stage = 'run_query';
-    await sendMessage(chatId, `⚙️ Настройка ${m === 'avito' ? 'Авито' : 'ВБ'}.\n📝 Шаг 1: Введите название поиска (например: iPhone):`, { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
+    await sendMessage(
+      chatId,
+      `⚙️ Настройка ${m === 'avito' ? 'Авито' : 'ВБ'}.\n📝 Шаг 1: Введите название поиска (например: iPhone):`,
+      skipKeyboard()
+    );
     return;
   }
 
@@ -991,7 +1039,7 @@ async function handleMessage(msg) {
       await sendMessage(
         chatId,
         `📝 Шаг 1/${m === 'avito' ? '8' : '7'}: Введите название поиска (например: iPhone):`,
-        { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false }
+        skipKeyboard()
       );
       return;
     }
@@ -1056,7 +1104,7 @@ async function handleMessage(msg) {
   if (state.stage === 'run_query') {
     state.runDraft.query = text === WIZARD_SKIP ? 'iPhone' : text;
     state.stage = 'run_model';
-    await sendMessage(chatId, '📝 Шаг 2/7: Введите модель (например: 15 Pro Max) или пропустите:', { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
+    await sendMessage(chatId, '📝 Шаг 2/7: Введите модель (например: 15 Pro Max) или пропустите:', skipKeyboard());
     return;
   }
 
@@ -1064,18 +1112,18 @@ async function handleMessage(msg) {
     state.runDraft.extraKeywords = text === WIZARD_SKIP ? '' : text;
     if (state.runDraft.marketplace === 'avito') {
       state.stage = 'run_city';
-      await sendMessage(chatId, '🌆 Шаг 3/8: Введите город Avito (например: Москва) или пропустите:', { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
+      await sendMessage(chatId, '🌆 Шаг 3/8: Введите город Avito (например: Москва) или пропустите:', skipKeyboard());
       return;
     }
     state.stage = 'run_min_price';
-    await sendMessage(chatId, '💰 Шаг 3/7: Цена ОТ (только число) или 0:', { keyboard: [[{ text: '0' }]], resize_keyboard: true, one_time_keyboard: false });
+    await sendMessage(chatId, '💰 Шаг 3/7: Цена ОТ (только число) или 0:', numberKeyboard('0'));
     return;
   }
 
   if (state.stage === 'run_city') {
     state.runDraft.city = text === WIZARD_SKIP ? 'moskva' : text;
     state.stage = 'run_min_price';
-    await sendMessage(chatId, '💰 Шаг 4/8: Цена ОТ (только число) или 0:', { keyboard: [[{ text: '0' }]], resize_keyboard: true, one_time_keyboard: false });
+    await sendMessage(chatId, '💰 Шаг 4/8: Цена ОТ (только число) или 0:', numberKeyboard('0'));
     return;
   }
 
@@ -1088,7 +1136,7 @@ async function handleMessage(msg) {
       state.runDraft.marketplace === 'avito'
         ? '💰 Шаг 5/8: Цена ДО (только число) или 0:'
         : '💰 Шаг 4/7: Цена ДО (только число) или 0:',
-      { keyboard: [[{ text: '0' }]], resize_keyboard: true, one_time_keyboard: false }
+      numberKeyboard('0')
     );
     return;
   }
