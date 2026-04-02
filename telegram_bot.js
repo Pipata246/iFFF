@@ -55,6 +55,16 @@ const MENU = {
   backToMenu: 'Назад в меню',
 };
 
+const STOP_PARSING_TEXT = 'Остановить парсинг';
+
+function buildStopKeyboard() {
+  return {
+    keyboard: [[{ text: STOP_PARSING_TEXT }]],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
+}
+
 const mainKeyboard = {
   keyboard: [
     [{ text: MENU.manualRun }, { text: MENU.autoSettings }],
@@ -225,7 +235,10 @@ function buildOnlyTodayKeyboard() {
   return yesNoKeyboard('Только за сегодня: ДА', 'Только за сегодня: НЕТ');
 }
 
-function buildSettingsKeyboard(settings) {
+function buildSettingsKeyboard(settings, opts = {}) {
+  const launchMode = Boolean(opts.launchMode);
+  const lastRow = launchMode ? [{ text: 'Запустить парсинг' }, { text: MENU.backToMenu }] : [{ text: MENU.backToMenu }];
+
   const onlyTodayYes = settings.onlyToday ? 'Только за сегодня: ДА' : 'Только за сегодня: НЕТ';
   const onlyTodayNo = settings.onlyToday ? 'Только за сегодня: НЕТ' : 'Только за сегодня: ДА';
   const priceYes = settings.priceFilterEnabled ? 'Цена: 43000-120000' : 'Цена: БЕЗ фильтра';
@@ -243,7 +256,7 @@ function buildSettingsKeyboard(settings) {
       [{ text: priceYes }, { text: priceNo }],
       [{ text: memYes }, { text: memNo }],
       [{ text: colorYes }, { text: colorNo }],
-      [{ text: MENU.backToMenu }],
+      lastRow,
     ],
     resize_keyboard: true,
     one_time_keyboard: false,
@@ -343,6 +356,8 @@ async function supabaseUpsertExcelFile({ telegramUserId, fileName, filePath, mar
 
 let isParsing = false;
 let lastRunMarketplace = null;
+const activeChildByChatId = new Map(); // chatId -> child process
+const stopRequestedByChatId = new Map(); // chatId -> boolean
 
 function buildParserEnvForRun({ chatId, marketplace, settings }) {
   // main.js переключаем в env mode (без readline)
@@ -350,6 +365,15 @@ function buildParserEnvForRun({ chatId, marketplace, settings }) {
     ...process.env,
     PARSER_USE_ENV: '1',
     PARSER_MARKETPLACE: marketplace,
+    // Always run unattended (no manual proxy prompts) for VPS bot runs
+    AVITO_MANUAL_PROXY: '0',
+    AVITO_WAIT_ENTER: '0',
+    // Ensure no WB home warmup (avoid going to WB home)
+    WB_USE_HOME_WARMUP: '0',
+    // Force headless by default on VPS
+    PLAYWRIGHT_HEADLESS: '1',
+    // Keep memory stable on 1GB RAM VPS
+    NODE_OPTIONS: process.env.NODE_OPTIONS || '--max-old-space-size=384',
     PARSER_QUERY: process.env.PARSER_QUERY || 'iPhone 15',
     PARSER_EXTRA_KEYWORDS: process.env.PARSER_EXTRA_KEYWORDS || '',
     PARSER_CITY: process.env.PARSER_CITY || 'moskva',
@@ -374,30 +398,142 @@ async function runParserForMarketplace({ chatId, marketplace }) {
 
   const state = getUserState(chatId);
   const settings = state.settings;
+  state.stage = 'parsing';
+
+  const stopKeyboard = buildStopKeyboard();
+  const mainLogKeywords = ['Шаг', 'ОБНАРУЖЕН БЛОК', 'ПОВТОР', 'УСПЕХ', 'Файл результатов'];
+  let stage1Sent = false;
+  let stage2Sent = false;
+  let stage3Sent = false;
+  let lastLogSendAt = 0;
+  const logTail = [];
 
   const beforeFiles = listExcelFilesOnServer();
   const beforePaths = new Set(beforeFiles.map((f) => f.filePath));
 
   await sendMessage(
     chatId,
-    `Парсинг запущен: ${marketplace === 'avito' ? 'Авито' : 'ВБ'}.\nОжидайте...`,
-    mainKeyboard
+    `Парсинг запущен: ${marketplace === 'avito' ? 'Авито' : 'ВБ'}.\nНажми кнопку «${STOP_PARSING_TEXT}», чтобы остановить.`,
+    stopKeyboard
   );
 
-  // Weak VPS: run parser as separate process to avoid blocking the bot event loop.
-  const child = spawn('npm', ['run', 'start:vps'], {
+  const env = buildParserEnvForRun({ chatId, marketplace, settings });
+
+  // Run main.js directly so we can stop it and stream stdout/stderr.
+  const child = spawn('node', ['main.js'], {
     cwd: PROJECT_DIR,
-    env: buildParserEnvForRun({ chatId, marketplace, settings }),
-    stdio: 'ignore', // keep journal cleaner
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
   });
 
+  activeChildByChatId.set(chatId, child);
+
+  function extractResultsFile(line) {
+    const m = line && line.match(/(results_[0-9A-Za-z_\\-:TZ.]+\\.xlsx)/i);
+    return m ? m[1] : null;
+  }
+
+  async function maybeSendLogs(force = false) {
+    const now = Date.now();
+    if (!force && now - lastLogSendAt < 8000) return;
+    lastLogSendAt = now;
+    const slice = logTail.slice(-20);
+    if (!slice.length) return;
+    await sendMessage(chatId, `Логи (последние):\n${slice.join('\n')}`, stopKeyboard);
+  }
+
+  function handleParserLine(line) {
+    const s = String(line || '').trimEnd();
+    if (!s) return;
+
+    const important = mainLogKeywords.some((k) => s.includes(k));
+    if (important) {
+      logTail.push(s);
+      if (logTail.length > 80) logTail.splice(0, logTail.length - 80);
+    }
+
+    if (!stage1Sent && s.includes('Шаг 1') && s.includes('Запуск браузера')) {
+      stage1Sent = true;
+      sendMessage(chatId, '1) Открываю страницу', stopKeyboard).catch(() => {});
+    }
+
+    if (
+      !stage2Sent &&
+      (s.includes('Шаг 5') ||
+        s.includes('Парсинг страницы выдачи') ||
+        s.includes('Ожидание карточек') ||
+        s.includes('Карточки товаров') ||
+        s.includes('Скролл ленты'))
+    ) {
+      stage2Sent = true;
+      sendMessage(chatId, '2) Страница открыта, начинаю парсинг', stopKeyboard).catch(() => {});
+    }
+
+    if (!stage3Sent && s.includes('Файл результатов')) {
+      stage3Sent = true;
+      const resultsFile = extractResultsFile(s);
+      const msg = resultsFile
+        ? `3) Парсинг завершен, ваш файл сохранен: ${resultsFile}`
+        : '3) Парсинг завершен, ваш файл сохранен';
+      sendMessage(chatId, msg, stopKeyboard).catch(() => {});
+      maybeSendLogs(true).catch(() => {});
+    } else if (important && (s.includes('Шаг') || s.includes('ОБНАРУЖЕН БЛОК') || s.includes('ПОВТОР'))) {
+      // occasionally push log chunk
+      maybeSendLogs(false).catch(() => {});
+    }
+  }
+
+  let stdoutBuffer = '';
+  child.stdout.on('data', (data) => {
+    try {
+      process.stdout.write(data.toString('utf8'));
+    } catch (_) {
+      /* ignore */
+    }
+    stdoutBuffer += data.toString('utf8');
+    const parts = stdoutBuffer.split(/\r?\n/);
+    stdoutBuffer = parts.pop() || '';
+    for (const line of parts) handleParserLine(line);
+  });
+  let stderrBuffer = '';
+  child.stderr.on('data', (data) => {
+    try {
+      process.stderr.write(data.toString('utf8'));
+    } catch (_) {
+      /* ignore */
+    }
+    stderrBuffer += data.toString('utf8');
+    const parts = stderrBuffer.split(/\r?\n/);
+    stderrBuffer = parts.pop() || '';
+    for (const line of parts) handleParserLine(line);
+  });
+
   child.on('exit', async (code) => {
+    activeChildByChatId.delete(chatId);
+    state.stage = 'main';
+    const stopped = Boolean(stopRequestedByChatId.get(chatId));
+    stopRequestedByChatId.delete(chatId);
+    if (stopped) {
+      try {
+        await sendMessage(chatId, 'Парсинг остановлен.', mainKeyboard);
+      } catch (_) {
+        /* ignore */
+      } finally {
+        isParsing = false;
+        lastRunMarketplace = null;
+      }
+      return;
+    }
     try {
       const afterFiles = listExcelFilesOnServer();
       const newOnes = afterFiles.filter((f) => !beforePaths.has(f.filePath));
       if (newOnes.length === 0) {
-        await sendMessage(chatId, `Парсинг завершен (exit code: ${code}). Но новых Excel файлов не найдено.`, mainKeyboard);
+        await sendMessage(
+          chatId,
+          `Парсинг завершен (exit code: ${code}). Но новых Excel файлов не найдено.`,
+          mainKeyboard
+        );
       } else {
         // store excel metadata to DB
         if (SUPABASE_URL && SUPABASE_ANON_KEY) {
@@ -461,6 +597,32 @@ async function handleMessage(msg) {
 
   const state = getUserState(chatId);
 
+  // Stop parsing button (while parser is running)
+  if (state.stage === 'parsing' && text === STOP_PARSING_TEXT) {
+    const child = activeChildByChatId.get(chatId);
+    if (child) {
+      stopRequestedByChatId.set(chatId, true);
+      try {
+        child.kill('SIGINT');
+      } catch (_) {
+        /* ignore */
+      }
+      setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch (_) {
+          /* ignore */
+        }
+      }, 10_000);
+    }
+    activeChildByChatId.delete(chatId);
+    isParsing = false;
+    lastRunMarketplace = null;
+    state.stage = 'main';
+    await sendMessage(chatId, 'Парсинг остановлен.', mainKeyboard);
+    return;
+  }
+
   // Upsert Telegram user in DB on /start
   if (/^\/start(?:@\w+)?(?:\s+.*)?$/i.test(text)) {
     try {
@@ -482,10 +644,12 @@ async function handleMessage(msg) {
 
   if (text === MENU.autoSettings) {
     state.stage = 'settings';
+    state.launchMode = false;
+    state.selectedMarketplace = null;
     await sendMessage(
       chatId,
       'Настройки автопарсинга. Нажимай кнопки ДА/НЕТ и значения.',
-      buildSettingsKeyboard(state.settings)
+      buildSettingsKeyboard(state.settings, { launchMode: false })
     );
     return;
   }
@@ -535,13 +699,25 @@ async function handleMessage(msg) {
   // Stage: choosing marketplace
   if (state.stage === 'choosing_market') {
     if (text === 'Авито') {
-      state.stage = 'main';
-      await runParserForMarketplace({ chatId, marketplace: 'avito' });
+      state.selectedMarketplace = 'avito';
+      state.launchMode = true;
+      state.stage = 'settings';
+      await sendMessage(
+        chatId,
+        'Настройки парсинга для Авито. Выбери фильтры и нажми `Запустить парсинг`.',
+        buildSettingsKeyboard(state.settings, { launchMode: true })
+      );
       return;
     }
     if (text === 'ВБ') {
-      state.stage = 'main';
-      await runParserForMarketplace({ chatId, marketplace: 'wb' });
+      state.selectedMarketplace = 'wb';
+      state.launchMode = true;
+      state.stage = 'settings';
+      await sendMessage(
+        chatId,
+        'Настройки парсинга для ВБ. Выбери фильтры и нажми `Запустить парсинг`.',
+        buildSettingsKeyboard(state.settings, { launchMode: true })
+      );
       return;
     }
     // ignore other texts in this stage
@@ -552,6 +728,13 @@ async function handleMessage(msg) {
   // Stage: settings wizard
   if (state.stage === 'settings') {
     const s = state.settings;
+    if (state.launchMode && text === 'Запустить парсинг') {
+      const marketplace = state.selectedMarketplace || 'avito';
+      state.stage = 'main';
+      state.launchMode = false;
+      await runParserForMarketplace({ chatId, marketplace });
+      return;
+    }
 
     if (text === 'Только за сегодня: ДА') {
       s.onlyToday = true;
@@ -602,6 +785,20 @@ async function handleMessage(msg) {
       s.colorFilterEnabled = false;
       s.color = '';
       await sendMessage(chatId, 'Ок: фильтр цвета выключен', buildSettingsKeyboard(s));
+      return;
+    }
+
+    // back from settings (for launch mode go back to marketplace chooser)
+    if (text === MENU.backToMenu) {
+      if (state.launchMode) {
+        state.stage = 'choosing_market';
+        state.selectedMarketplace = null;
+        state.launchMode = false;
+        await sendMessage(chatId, 'Выбери площадку:', buildMarketplaceKeyboard());
+      } else {
+        state.stage = 'main';
+        await sendMessage(chatId, 'Ок, меню.', mainKeyboard);
+      }
       return;
     }
 
