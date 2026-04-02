@@ -387,7 +387,7 @@ function buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides =
     NODE_OPTIONS: process.env.NODE_OPTIONS || '--max-old-space-size=384',
     PARSER_QUERY: o.query != null ? String(o.query) : process.env.PARSER_QUERY || 'iPhone 15',
     PARSER_EXTRA_KEYWORDS: o.extraKeywords != null ? String(o.extraKeywords) : process.env.PARSER_EXTRA_KEYWORDS || '',
-    PARSER_CITY: process.env.PARSER_CITY || 'moskva',
+    PARSER_CITY: o.city != null ? String(o.city) : process.env.PARSER_CITY || 'moskva',
     PARSER_MIN_PRICE: o.minPrice != null ? String(o.minPrice) : settings.priceFilterEnabled ? String(settings.minPrice) : '0',
     PARSER_MAX_PRICE: o.maxPrice != null ? String(o.maxPrice) : settings.priceFilterEnabled ? String(settings.maxPrice) : '0',
     PARSER_MEMORY: o.memory != null ? String(o.memory) : settings.memoryFilterEnabled ? String(settings.memoryGb) : '',
@@ -450,7 +450,7 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
     // Prevent "late" stage messages after the result was already emitted.
     if (!stage3Emitted && !stage1Sent && (s.includes('Адрес поиска') || s.includes('Переход на') || s.includes('Открываю страницу'))) {
       stage1Sent = true;
-      sendMessage(chatId, '1) Открываю страницу', stopKeyboard).catch(() => {});
+      sendMessage(chatId, '1) 🌐 Открываю страницу', stopKeyboard).catch(() => {});
     }
 
     if (
@@ -464,7 +464,7 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
         s.includes('Парсинг карточек'))
     ) {
       stage2Sent = true;
-      sendMessage(chatId, '2) Страница открыта, начинаю парсинг', stopKeyboard).catch(() => {});
+      sendMessage(chatId, '2) ✅ Страница открыта, начинаю парсинг', stopKeyboard).catch(() => {});
     }
   }
 
@@ -500,7 +500,7 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
     stopRequestedByChatId.delete(chatId);
     if (stopped) {
       try {
-        await sendMessage(chatId, 'Парсинг остановлен.', mainKeyboard);
+        await sendMessage(chatId, '⛔ Парсинг остановлен.', mainKeyboard);
       } catch (_) {
         /* ignore */
       } finally {
@@ -533,8 +533,8 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
       await sendMessage(
         chatId,
         bestFile
-          ? `3) Парсинг завершен, ваш файл сохранен: ${bestFile}`
-          : '3) Парсинг завершен, но новый файл Excel не найден.',
+          ? `✅ 3) Парсинг завершен, ваш файл сохранен: ${bestFile}`
+          : '⚠️ 3) Парсинг завершен, но новый файл Excel не найден.',
         mainKeyboard
       );
     } catch (e) {
@@ -598,7 +598,7 @@ async function handleMessage(msg) {
     isParsing = false;
     lastRunMarketplace = null;
     state.stage = 'main';
-    await sendMessage(chatId, 'Парсинг остановлен.', mainKeyboard);
+    await sendMessage(chatId, '⛔ Парсинг остановлен.', mainKeyboard);
     return;
   }
 
