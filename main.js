@@ -636,6 +636,30 @@ function isLikelyProxyOrTunnelDrop(err) {
 }
 
 /**
+ * Для Avito: подтверждаем блок не мгновенно, а после дополнительного «мягкого» ожидания.
+ * Это снижает ложные срабатывания на переходных состояниях/оверлеях.
+ * @param {import('playwright').Page} page
+ * @param {string} pageLabel
+ * @returns {Promise<boolean>} true => блок подтверждён, false => блок не подтвердился
+ */
+async function confirmAvitoBlockAfterSoftWait(page, pageLabel) {
+  log(`  [${pageLabel}] первичный сигнал блока/капчи — делаем мягкую перепроверку (без резких действий)…`);
+  await randomDelay(15_000, 25_000);
+  await page.waitForLoadState('load', { timeout: 45_000 }).catch((e) => {
+    log(`  [${pageLabel}] load на перепроверке не дождались: ${String(e?.message || e || '').slice(0, 96)}`);
+  });
+  await randomDelay(2_500, 6_000);
+  const blocked = await detectBlock(page);
+  if (blocked) {
+    logBlock(`[${pageLabel}] блок/капча подтверждён после мягкой перепроверки`);
+    return true;
+  }
+  const cnt = await page.locator(ITEM_SELECTOR).count().catch(() => 0);
+  log(`  [${pageLabel}] блок не подтвердился после ожидания; карточек в DOM сейчас: ${cnt}`);
+  return false;
+}
+
+/**
  * @param {import('readline').Interface} rl
  * @param {string} q
  * @returns {Promise<string>}
@@ -947,9 +971,13 @@ async function runAttempt(params) {
         if (st === 403 || st === 429) {
           log(`  ответ сервера: HTTP ${st} — ограничение по IP / частота запросов`);
           logNetFailureHelp(new Error(`HTTP ${st}`));
-          skipEnterBeforeClose = true;
-          rememberAvitoListingForIpRetry({ domGateCtx, crawlState, openUrl });
-          throw new Error('IP_BLOCK');
+          const blockedConfirmed = await confirmAvitoBlockAfterSoftWait(page, 'первая навигация Avito');
+          if (blockedConfirmed) {
+            skipEnterBeforeClose = true;
+            rememberAvitoListingForIpRetry({ domGateCtx, crawlState, openUrl });
+            throw new Error('IP_BLOCK');
+          }
+          log('  HTTP 403/429 был переходным — продолжаем обычный gate load/капча/DOM.');
         }
         if (st >= 400) {
           log(`  ответ сервера: HTTP ${st}`);
@@ -963,13 +991,39 @@ async function runAttempt(params) {
       if (isLikelyProxyOrTunnelDrop(navErr)) {
         log(`  навигация: ${m}`);
         logNetFailureHelp(navErr);
-        log('  Считаем это сбоем канала через прокси → пауза ротации (как при IP_BLOCK), затем повтор при лимите AVITO_IP_ROTATION_TRIES.');
-        skipEnterBeforeClose = true;
-        rememberAvitoListingForIpRetry({ domGateCtx, crawlState, openUrl });
-        throw new Error('IP_BLOCK');
+        log('  Мягкий режим: ждём и делаем один повтор goto в этой же сессии перед ротацией IP…');
+        await randomDelay(12_000, 22_000);
+        try {
+          const retryResp = await page.goto(openUrl, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
+          if (retryResp) {
+            const retryStatus = retryResp.status();
+            if (retryStatus === 403 || retryStatus === 429) {
+              log(`  повтор goto: HTTP ${retryStatus} — перепроверяем блок перед ротацией IP…`);
+              const blockedConfirmed = await confirmAvitoBlockAfterSoftWait(page, 'повторная навигация Avito');
+              if (blockedConfirmed) {
+                skipEnterBeforeClose = true;
+                rememberAvitoListingForIpRetry({ domGateCtx, crawlState, openUrl });
+                throw new Error('IP_BLOCK');
+              }
+              log('  после повтора блок не подтвердился — продолжаем обычный gate.');
+            } else if (retryStatus >= 400) {
+              log(`  повтор goto: HTTP ${retryStatus}`);
+              throw new Error(`Открытие Avito после повтора: HTTP ${retryStatus}`);
+            }
+          }
+        } catch (retryErr) {
+          const rm = retryErr && retryErr.message ? retryErr.message : String(retryErr);
+          if (rm === 'IP_BLOCK') throw retryErr;
+          log(`  повтор goto не помог: ${rm}`);
+          log('  Переходим к ротации IP (как при IP_BLOCK) и внешнему ретраю.');
+          skipEnterBeforeClose = true;
+          rememberAvitoListingForIpRetry({ domGateCtx, crawlState, openUrl });
+          throw new Error('IP_BLOCK');
+        }
+      } else {
+        logNetFailureHelp(navErr);
+        throw navErr;
       }
-      logNetFailureHelp(navErr);
-      throw navErr;
     }
 
     log('  после перехода: load, капча и карточки — единая проверка (шаги 6–8 в логе)');
