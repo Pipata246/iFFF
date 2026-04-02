@@ -83,7 +83,9 @@ function getProxyOptions() {
 async function launchBrowser() {
   /** @type {import('playwright').LaunchOptions} */
   const launchOpts = {
-    headless: false,
+    // VPS запуск: браузер не должен отображаться (headless по умолчанию).
+    // Чтобы открыть браузер с UI локально: PLAYWRIGHT_HEADLESS=0 node main.js
+    headless: process.env.PLAYWRIGHT_HEADLESS === '0' ? false : true,
     args: [
       '--disable-blink-features=AutomationControlled',
       '--disable-dev-shm-usage',
