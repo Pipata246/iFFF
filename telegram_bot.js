@@ -54,13 +54,14 @@ const MENU = {
   guide: '📘 Инструкция',
   excels: '📁 Эксель файлы',
   checkAutoparse: '🔎 Проверить автопарсинг',
-  avitoParams: '🛒 Параметры Авито',
   backToMenu: '⬅️ Назад в меню',
 };
 
-/** Подменю автопарсинга (только Wildberries). */
 const AUTO_WB_FILTERS = '🔧 Настроить фильтры';
 const AUTO_WB_INTERVAL = '⏱ Настроить периодичность';
+const AUTO_EDIT_AVITO = '✏️ Авито — изменить фильтры';
+const AUTO_EDIT_WB = '✏️ ВБ — изменить фильтры';
+const AUTO_BACK_TO_AUTO_MAIN = '⬅️ К настройкам автопарсинга';
 const AUTO_WB_ENABLED = '✅ Автопарсинг ВКЛ';
 const AUTO_WB_DISABLED = '⏸ Автопарсинг ВЫКЛ';
 
@@ -78,7 +79,7 @@ const mainKeyboard = {
   keyboard: [
     [{ text: MENU.manualRun }, { text: MENU.autoSettings }],
     [{ text: MENU.guide }, { text: MENU.excels }],
-    [{ text: MENU.checkAutoparse }, { text: MENU.avitoParams }],
+    [{ text: MENU.checkAutoparse }],
   ],
   resize_keyboard: true,
   one_time_keyboard: false,
@@ -88,7 +89,7 @@ const startText =
   '🤖 Бот помогает находить выгодные iPhone на Авито и Wildberries.\n\n' +
   '📌 `Ручной запуск` — выбери площадку и параметры.\n\n' +
   '⚙️ `Настройки автопарсинга` — автообход ВБ по расписанию и уведомления о новых объявлениях.\n\n' +
-  '🔎 `Проверить автопарсинг` — статус и время следующего запуска.\n\n' +
+  '🔎 `Проверить автопарсинг` — статус и время следующего запуска ВБ.\n\n' +
   '📁 `Эксель файлы` — список и выгрузка результатов.';
 
 const yesNoKeyboard = (yesText, noText) => ({
@@ -236,7 +237,7 @@ function getUserState(chatId) {
         avito: null,
         wb: null,
       },
-      returnToAutoMenu: false,
+      returnToAutoFiltersHub: false,
     });
   }
   return userStateByChatId.get(chatId);
@@ -808,7 +809,7 @@ async function supabaseResetAllWbAutoparseRunning() {
   }
 }
 
-function buildAutoWbMenuKeyboard() {
+function buildAutoSettingsMainKeyboard() {
   return {
     keyboard: [
       [{ text: AUTO_WB_FILTERS }],
@@ -818,6 +819,37 @@ function buildAutoWbMenuKeyboard() {
     resize_keyboard: true,
     one_time_keyboard: false,
   };
+}
+
+function buildAutoFiltersHubKeyboard() {
+  return {
+    keyboard: [
+      [{ text: AUTO_EDIT_AVITO }],
+      [{ text: AUTO_EDIT_WB }],
+      [{ text: AUTO_BACK_TO_AUTO_MAIN }],
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
+}
+
+/** Экран выбора площадки для фильтров + текущие сохранённые настройки из БД. */
+async function sendAutoFiltersHubScreen(chatId, telegramUserId, extraNotice = '') {
+  const rows = await supabaseFetchMarketSettingsAll(telegramUserId).catch(() => []);
+  const avitoRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'avito');
+  const wbRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'wb');
+  const state = getUserState(chatId);
+  state.marketSettings.avito = avitoRow ? mapRowToMarketSettings(avitoRow) : null;
+  state.marketSettings.wb = wbRow ? mapRowToMarketSettings(wbRow) : null;
+  state.stage = 'auto_filters_hub';
+  const head = extraNotice ? `${extraNotice}\n\n` : '';
+  const text =
+    `${head}` +
+    `📋 *Текущие сохранённые фильтры*\n\n` +
+    `${formatMarketSettingsBlock('🛒 Авито', state.marketSettings.avito)}\n\n` +
+    `${formatWbSettingsBlock('🛍️ Wildberries (автопарсинг)', state.marketSettings.wb)}\n\n` +
+    `Выберите площадку — откроется мастер изменения и сохранения в БД:`;
+  await sendMessage(chatId, text, buildAutoFiltersHubKeyboard(), 'Markdown');
 }
 
 function buildWbIntervalKeyboard(st) {
@@ -839,6 +871,8 @@ function buildWbIntervalKeyboard(st) {
 
 let isParsing = false;
 let lastRunMarketplace = null;
+/** Тихий запуск ВБ из планировщика автопарсинга (для сообщения при ручном запуске). */
+let wbAutoparseWbRunning = false;
 const activeChildByChatId = new Map(); // chatId -> child process
 const stopRequestedByChatId = new Map(); // chatId -> boolean
 
@@ -1015,12 +1049,24 @@ async function runParserForMarketplace({
   wbSnapshotPath = null,
   wbAutoparseHook = null,
 }) {
+  if (!silent && wbAutoparseWbRunning) {
+    await sendMessage(
+      chatId,
+      '⏳ Сейчас идёт автопарсинг Wildberries. Повторите ручной запуск позже.',
+      mainKeyboard
+    );
+    return;
+  }
   if (isParsing) {
     if (!silent) await sendMessage(chatId, 'Парсинг уже запущен. Подождите, пожалуйста.');
     return;
   }
 
+  const markSilentWbAutoparse = Boolean(silent && marketplace === 'wb');
   isParsing = true;
+  if (markSilentWbAutoparse) {
+    wbAutoparseWbRunning = true;
+  }
   lastRunMarketplace = marketplace;
 
   const state = getUserState(chatId);
@@ -1107,6 +1153,9 @@ async function runParserForMarketplace({
   });
 
   child.on('exit', async (code) => {
+    if (markSilentWbAutoparse) {
+      wbAutoparseWbRunning = false;
+    }
     activeChildByChatId.delete(chatId);
     state.stage = 'main';
     const stopped = Boolean(stopRequestedByChatId.get(chatId));
@@ -1333,20 +1382,29 @@ async function handleMessage(msg) {
   const state = getUserState(chatId);
 
   if (text === WIZARD_CANCEL) {
-    const backAuto = state.returnToAutoMenu;
-    state.stage = backAuto ? 'auto_wb_menu' : 'main';
+    if (state.returnToAutoFiltersHub) {
+      state.runDraft = null;
+      state.configureOnly = false;
+      state.selectedMarketplaceForRun = null;
+      state.selectedMarketplace = null;
+      state.launchMode = false;
+      state.excelDeleteCandidates = [];
+      state.returnToAutoFiltersHub = false;
+      try {
+        await sendAutoFiltersHubScreen(chatId, msg.from?.id, '❌ Мастер отменён.');
+      } catch (e) {
+        await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoFiltersHubKeyboard());
+      }
+      return;
+    }
+    state.stage = 'main';
     state.runDraft = null;
     state.configureOnly = false;
     state.selectedMarketplaceForRun = null;
     state.selectedMarketplace = null;
     state.launchMode = false;
     state.excelDeleteCandidates = [];
-    state.returnToAutoMenu = false;
-    await sendMessage(
-      chatId,
-      '❌ Отменено.',
-      backAuto ? buildAutoWbMenuKeyboard() : mainKeyboard
-    );
+    await sendMessage(chatId, '❌ Отменено. Возврат в главное меню.', mainKeyboard);
     return;
   }
 
@@ -1405,6 +1463,83 @@ async function handleMessage(msg) {
     return;
   }
 
+  if (state.stage === 'auto_filters_hub') {
+    if (text === AUTO_BACK_TO_AUTO_MAIN) {
+      state.stage = 'auto_settings_main';
+      await sendMessage(
+        chatId,
+        '⚙️ *Настройки автопарсинга*\n\nВыберите действие:',
+        buildAutoSettingsMainKeyboard(),
+        'Markdown'
+      );
+      return;
+    }
+    if (text === AUTO_EDIT_AVITO) {
+      try {
+        const rows = await supabaseFetchMarketSettingsAll(msg.from?.id);
+        const avitoRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'avito');
+        state.marketSettings.avito = avitoRow ? mapRowToMarketSettings(avitoRow) : null;
+        const current = state.marketSettings.avito;
+        state.configureOnly = true;
+        state.returnToAutoFiltersHub = true;
+        state.runDraft = {
+          marketplace: 'avito',
+          query: current?.query || 'iPhone',
+          extraKeywords: current?.extraKeywords || '',
+          city: current?.city || 'moskva',
+          minPrice: Number(current?.minPrice || 0),
+          maxPrice: Number(current?.maxPrice || 0),
+          memory: current?.memory || '',
+          onlyToday: Boolean(current?.onlyToday),
+          color: current?.color || '',
+        };
+        state.stage = 'run_query';
+        await sendMessage(
+          chatId,
+          '🛒 *Авито* — шаг 1/8: название поиска (для ручного запуска):',
+          skipKeyboard(),
+          'Markdown'
+        );
+      } catch (e) {
+        await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoFiltersHubKeyboard());
+      }
+      return;
+    }
+    if (text === AUTO_EDIT_WB) {
+      try {
+        const rows = await supabaseFetchMarketSettingsAll(msg.from?.id);
+        const wbRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'wb');
+        state.marketSettings.wb = wbRow ? mapRowToMarketSettings(wbRow) : null;
+        const current = state.marketSettings.wb;
+        state.configureOnly = true;
+        state.returnToAutoFiltersHub = true;
+        state.runDraft = {
+          marketplace: 'wb',
+          query: current?.query || 'iPhone',
+          extraKeywords: current?.extraKeywords || '',
+          city: current?.city || 'moskva',
+          minPrice: Number(current?.minPrice || 0),
+          maxPrice: Number(current?.maxPrice || 0),
+          memory: current?.memory || '',
+          onlyToday: Boolean(current?.onlyToday),
+          color: current?.color || '',
+        };
+        state.stage = 'run_query';
+        await sendMessage(
+          chatId,
+          '🛍️ *Wildberries* — шаг 1/7: название поиска (автопарсинг):',
+          skipKeyboard(),
+          'Markdown'
+        );
+      } catch (e) {
+        await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoFiltersHubKeyboard());
+      }
+      return;
+    }
+    await sendMessage(chatId, '👇 Выберите площадку кнопкой или вернитесь назад.', buildAutoFiltersHubKeyboard());
+    return;
+  }
+
   // Main menu buttons
   if (text === MENU.manualRun) {
     state.stage = 'choosing_market';
@@ -1415,13 +1550,14 @@ async function handleMessage(msg) {
   }
 
   if (text === MENU.autoSettings) {
-    state.stage = 'auto_wb_menu';
+    state.stage = 'auto_settings_main';
     await sendMessage(
       chatId,
-      '⚙️ *Автопарсинг Wildberries*\n\n' +
-        'Фильтры задаются отдельно от Авито. Первый запуск сохраняет базу объявлений (уведомлений нет), далее приходят только *новые* позиции.\n\n' +
+      '⚙️ *Настройки автопарсинга*\n\n' +
+        '*Wildberries:* по расписанию собирает выдачу; первый прогон создаёт базу без уведомлений, затем приходят только *новые* объявления.\n\n' +
+        '*Фильтры:* для Авито и ВБ хранятся отдельно — задайте их в пункте «Настроить фильтры».\n\n' +
         'Выберите действие:',
-      buildAutoWbMenuKeyboard(),
+      buildAutoSettingsMainKeyboard(),
       'Markdown'
     );
     return;
@@ -1431,7 +1567,7 @@ async function handleMessage(msg) {
     try {
       const st = await supabaseFetchWbAutoparseState(msg.from?.id);
       const runningDb = Boolean(st?.is_running);
-      const runningLocal = isParsing && lastRunMarketplace === 'wb';
+      const runningLocal = (isParsing && lastRunMarketplace === 'wb') || wbAutoparseWbRunning;
       const running = runningDb || runningLocal;
       const fmt = (iso) => {
         if (!iso) return '—';
@@ -1466,39 +1602,7 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (text === MENU.avitoParams) {
-    try {
-      const rows = await supabaseFetchMarketSettingsAll(msg.from?.id);
-      const avitoRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'avito');
-      state.marketSettings.avito = avitoRow ? mapRowToMarketSettings(avitoRow) : null;
-      const current = state.marketSettings.avito;
-      state.configureOnly = true;
-      state.returnToAutoMenu = false;
-      state.runDraft = {
-        marketplace: 'avito',
-        query: current?.query || 'iPhone',
-        extraKeywords: current?.extraKeywords || '',
-        city: current?.city || 'moskva',
-        minPrice: Number(current?.minPrice || 0),
-        maxPrice: Number(current?.maxPrice || 0),
-        memory: current?.memory || '',
-        onlyToday: Boolean(current?.onlyToday),
-        color: current?.color || '',
-      };
-      state.stage = 'run_query';
-      await sendMessage(
-        chatId,
-        '🛒 *Параметры Авито* (для ручного запуска). Шаг 1/8: название поиска:',
-        skipKeyboard(),
-        'Markdown'
-      );
-    } catch (e) {
-      await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, mainKeyboard);
-    }
-    return;
-  }
-
-  if (state.stage === 'auto_wb_menu') {
+  if (state.stage === 'auto_settings_main') {
     if (text === MENU.backToMenu) {
       state.stage = 'main';
       await sendMessage(chatId, '⬅️ Главное меню.', mainKeyboard);
@@ -1506,35 +1610,11 @@ async function handleMessage(msg) {
     }
     if (text === AUTO_WB_FILTERS) {
       try {
-        const rows = await supabaseFetchMarketSettingsAll(msg.from?.id);
-        const wbRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'wb');
-        state.marketSettings.wb = wbRow ? mapRowToMarketSettings(wbRow) : null;
-        const current = state.marketSettings.wb;
-        state.configureOnly = true;
-        state.returnToAutoMenu = true;
-        state.runDraft = {
-          marketplace: 'wb',
-          query: current?.query || 'iPhone',
-          extraKeywords: current?.extraKeywords || '',
-          city: current?.city || 'moskva',
-          minPrice: Number(current?.minPrice || 0),
-          maxPrice: Number(current?.maxPrice || 0),
-          memory: current?.memory || '',
-          onlyToday: Boolean(current?.onlyToday),
-          color: current?.color || '',
-        };
-        state.stage = 'run_query';
-        await sendMessage(
-          chatId,
-          '🔧 *Фильтры ВБ* — шаг 1/7: введите название поиска (например iPhone):',
-          skipKeyboard(),
-          'Markdown'
-        );
-        return;
+        await sendAutoFiltersHubScreen(chatId, msg.from?.id);
       } catch (e) {
-        await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoWbMenuKeyboard());
-        return;
+        await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoSettingsMainKeyboard());
       }
+      return;
     }
     if (text === AUTO_WB_INTERVAL) {
       try {
@@ -1551,18 +1631,18 @@ async function handleMessage(msg) {
         );
         return;
       } catch (e) {
-        await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoWbMenuKeyboard());
+        await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoSettingsMainKeyboard());
         return;
       }
     }
-    await sendMessage(chatId, '👇 Выберите пункт меню автопарсинга.', buildAutoWbMenuKeyboard());
+    await sendMessage(chatId, '👇 Выберите пункт меню автопарсинга.', buildAutoSettingsMainKeyboard());
     return;
   }
 
   if (state.stage === 'wb_auto_interval') {
     if (text === MENU.backToMenu) {
-      state.stage = 'auto_wb_menu';
-      await sendMessage(chatId, '⬅️ Назад.', buildAutoWbMenuKeyboard());
+      state.stage = 'auto_settings_main';
+      await sendMessage(chatId, '⬅️ Назад.', buildAutoSettingsMainKeyboard());
       return;
     }
     const intervalMap = {
@@ -1616,18 +1696,17 @@ async function handleMessage(msg) {
     await sendMessage(
       chatId,
       '📘 *Инструкция*\n\n' +
-        '1️⃣ _⚙️ Настройки автопарсинга_ — только *Wildberries*: «Настроить фильтры» и «Настроить периодичность». Первый автозапуск сохраняет базу объявлений (без уведомлений), дальше приходят только *новые*.\n\n' +
-        '2️⃣ _🛒 Параметры Авито_ — сохранённые фильтры для ручного запуска (автопарсинг только у ВБ).\n\n' +
-        '3️⃣ _🔎 Проверить автопарсинг_ — статус и время следующего автообхода ВБ.\n\n' +
-        '4️⃣ _🚀 Ручной запуск_ → площадка → режим:\n\n' +
+        '1️⃣ _⚙️ Настройки автопарсинга_ → «Настроить фильтры» (видны сохранённые настройки Авито и ВБ, выбор площадки) или «Настроить периодичность» (только ВБ). Первый автообход ВБ создаёт базу без уведомлений, затем — только *новые*.\n\n' +
+        '2️⃣ _🔎 Проверить автопарсинг_ — статус и время следующего автообхода ВБ.\n\n' +
+        '3️⃣ _🚀 Ручной запуск_ → площадка → режим:\n\n' +
         '    • _▶️ Продолжить с настройками автопарсинга_\n' +
         '    • _✍️ Задать вручную_\n\n' +
-        '5️⃣ На шагах мастера: _❌ Отмена_ — без сохранения (из автопарсинга ВБ вернёт в его меню).\n\n' +
-        '6️⃣ При *ручном* парсинге бот пишет этапы:\n\n' +
+        '4️⃣ На шагах мастера: _❌ Отмена_ — возврат к экрану фильтров или в меню.\n\n' +
+        '5️⃣ При *ручном* парсинге бот пишет этапы:\n\n' +
         '    • 🌐 Захожу на страницу\n' +
         '    • ✅ Страница открыта, собираю данные\n' +
         '    • ✅ Парсинг завершен, ваш файл сохранен\n\n' +
-        '7️⃣ _📁 Эксель файлы_:\n\n' +
+        '6️⃣ _📁 Эксель файлы_:\n\n' +
         '    • _👀 Посмотреть_ — отправка файлов\n' +
         '    • _🗑 Удалить_ — с сервера и из БД\n\n' +
         '────────────\n\n' +
@@ -2012,8 +2091,8 @@ async function handleMessage(msg) {
       state.stage = 'main';
       if (state.configureOnly) {
         state.configureOnly = false;
-        const backAuto = state.returnToAutoMenu;
-        state.returnToAutoMenu = false;
+        const backAuto = state.returnToAutoFiltersHub;
+        state.returnToAutoFiltersHub = false;
         if (backAuto && d.marketplace === 'wb') {
           try {
             const prev = await supabaseFetchWbAutoparseState(msg.from?.id);
@@ -2032,12 +2111,15 @@ async function handleMessage(msg) {
           } catch (e) {
             console.error('wb_autoparse on filter save:', String(e?.message || e || ''));
           }
-          state.stage = 'auto_wb_menu';
-          await sendMessage(
+          await sendAutoFiltersHubScreen(
             chatId,
-            '✅ Фильтры Wildberries сохранены в БД.\n\nЕсли фильтры изменились — база сравнения сброшена; первый прогон снова создаст базу без уведомлений.',
-            buildAutoWbMenuKeyboard()
+            msg.from?.id,
+            '✅ Фильтры Wildberries сохранены в БД.\n\nЕсли фильтры изменились — база сравнения сброшена; первый прогон снова создаст базу без уведомлений.'
           );
+          return;
+        }
+        if (backAuto && d.marketplace === 'avito') {
+          await sendAutoFiltersHubScreen(chatId, msg.from?.id, '✅ Фильтры Авито сохранены в БД.');
           return;
         }
         await sendMessage(
@@ -2070,12 +2152,15 @@ async function handleMessage(msg) {
       return;
     }
     if (text === MENU.backToMenu) {
-      if (state.returnToAutoMenu) {
-        state.returnToAutoMenu = false;
+      if (state.returnToAutoFiltersHub) {
+        state.returnToAutoFiltersHub = false;
         state.runDraft = null;
         state.configureOnly = false;
-        state.stage = 'auto_wb_menu';
-        await sendMessage(chatId, '⬅️ Назад в меню автопарсинга.', buildAutoWbMenuKeyboard());
+        try {
+          await sendAutoFiltersHubScreen(chatId, msg.from?.id);
+        } catch (e) {
+          await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoFiltersHubKeyboard());
+        }
         return;
       }
       state.stage = 'main';
