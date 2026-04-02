@@ -421,7 +421,6 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
   const stopKeyboard = buildStopKeyboard();
   let stage1Sent = false;
   let stage2Sent = false;
-  let stage3Sent = false;
   let stage3Emitted = false;
 
   const beforeFiles = listExcelFilesOnServer();
@@ -466,16 +465,6 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
     ) {
       stage2Sent = true;
       sendMessage(chatId, '2) Страница открыта, начинаю парсинг', stopKeyboard).catch(() => {});
-    }
-
-    if (!stage3Sent && s.includes('Файл результатов')) {
-      stage3Sent = true;
-      stage3Emitted = true;
-      const resultsFile = extractResultsFile(s);
-      const msg = resultsFile
-        ? `3) Парсинг завершен, ваш файл сохранен: ${resultsFile}`
-        : '3) Парсинг завершен, ваш файл сохранен';
-      sendMessage(chatId, msg, stopKeyboard).catch(() => {});
     }
   }
 
@@ -523,36 +512,31 @@ async function runParserForMarketplace({ chatId, marketplace, parserOverrides = 
     try {
       const afterFiles = listExcelFilesOnServer();
       const newOnes = afterFiles.filter((f) => !beforePaths.has(f.filePath));
-      if (newOnes.length === 0) {
-        await sendMessage(
-          chatId,
-          `Парсинг завершен (exit code: ${code}). Но новых Excel файлов не найдено.`,
-          mainKeyboard
-        );
-      } else {
-        // store excel metadata to DB
-        if (SUPABASE_URL && SUPABASE_ANON_KEY) {
-          for (const f of newOnes) {
-            try {
-              await supabaseUpsertExcelFile({
-                telegramUserId: chatId,
-                fileName: f.fileName,
-                filePath: f.filePath,
-                marketplace,
-              });
-            } catch (e) {
-              console.error('Excel upsert error:', String(e?.message || e || ''));
-            }
+      // store excel metadata to DB (best-effort)
+      if (SUPABASE_URL && SUPABASE_ANON_KEY && newOnes.length > 0) {
+        for (const f of newOnes) {
+          try {
+            await supabaseUpsertExcelFile({
+              telegramUserId: chatId,
+              fileName: f.fileName,
+              filePath: f.filePath,
+              marketplace,
+            });
+          } catch (e) {
+            console.error('Excel upsert error:', String(e?.message || e || ''));
           }
         }
-
-        await sendMessage(
-          chatId,
-          `Готово! Создано ${newOnes.length} Excel файлов:\n` +
-            newOnes.map((f) => `• ${f.fileName}`).join('\n'),
-          mainKeyboard
-        );
       }
+
+      stage3Emitted = true;
+      const bestFile = newOnes.length > 0 ? newOnes[0].fileName : null;
+      await sendMessage(
+        chatId,
+        bestFile
+          ? `3) Парсинг завершен, ваш файл сохранен: ${bestFile}`
+          : '3) Парсинг завершен, но новый файл Excel не найден.',
+        mainKeyboard
+      );
     } catch (e) {
       console.error('After parse handler error:', String(e?.message || e || ''));
       await sendMessage(chatId, `Ошибка после завершения парсинга: ${String(e?.message || e || '')}`, mainKeyboard);
