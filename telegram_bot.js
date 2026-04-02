@@ -91,9 +91,20 @@ const WIZARD_NO = '❌ Нет';
 const WIZARD_SKIP = '⏭️ Пропустить';
 const WIZARD_START = '🚀 Запустить парсинг';
 const SETTINGS_EDIT = '✏️ Изменить настройки';
+const SETTINGS_AVITO = '🛒 Настроить Авито';
+const SETTINGS_WB = '🛍️ Настроить ВБ';
+const SETTINGS_SAVE = '💾 Сохранить настройки';
 
 function wizardYesNoKeyboard() {
   return yesNoKeyboard(WIZARD_YES, WIZARD_NO);
+}
+
+function confirmKeyboard(configureOnly) {
+  return {
+    keyboard: [[{ text: configureOnly ? SETTINGS_SAVE : WIZARD_START }, { text: MENU.backToMenu }]],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -180,6 +191,10 @@ function getUserState(chatId) {
       stage: 'main', // main | choosing_market | settings_only_today | settings_price | settings_memory | settings_color
       runDraft: null,
       configureOnly: false,
+      marketSettings: {
+        avito: null,
+        wb: null,
+      },
     });
   }
   return userStateByChatId.get(chatId);
@@ -400,6 +415,88 @@ async function supabaseUpsertUserSettings(tgUserId, s) {
     const txt = await resp.text().catch(() => '');
     throw new Error(`Supabase user_settings upsert failed: HTTP ${resp.status}: ${txt}`);
   }
+}
+
+async function supabaseFetchMarketSettingsAll(tgUserId) {
+  const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  if (!hasSupabaseCfg || !tgUserId) return [];
+  const qs = new URLSearchParams({
+    telegram_user_id: `eq.${String(tgUserId)}`,
+    select: 'telegram_user_id,marketplace,query,extra_keywords,city,min_price,max_price,memory,color,only_today',
+  });
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/user_market_settings?${qs.toString()}`, {
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      'content-type': 'application/json',
+    },
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`Supabase user_market_settings select failed: HTTP ${resp.status}: ${txt}`);
+  }
+  const rows = await resp.json();
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function supabaseUpsertMarketSettings(tgUserId, marketplace, s) {
+  const hasSupabaseCfg = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  if (!hasSupabaseCfg || !tgUserId) return;
+  const payload = [
+    {
+      telegram_user_id: String(tgUserId),
+      marketplace,
+      query: s.query || 'iPhone',
+      extra_keywords: s.extraKeywords || '',
+      city: s.city || 'moskva',
+      min_price: Number.isFinite(Number(s.minPrice)) ? Number(s.minPrice) : 0,
+      max_price: Number.isFinite(Number(s.maxPrice)) ? Number(s.maxPrice) : 0,
+      memory: s.memory || '',
+      color: s.color || '',
+      only_today: Boolean(s.onlyToday),
+    },
+  ];
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/user_market_settings`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      'content-type': 'application/json',
+      Prefer: 'resolution=merge-duplicates,return=minimal',
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`Supabase user_market_settings upsert failed: HTTP ${resp.status}: ${txt}`);
+  }
+}
+
+function mapRowToMarketSettings(row) {
+  return {
+    query: row.query || 'iPhone',
+    extraKeywords: row.extra_keywords || '',
+    city: row.city || 'moskva',
+    minPrice: Number(row.min_price || 0),
+    maxPrice: Number(row.max_price || 0),
+    memory: row.memory || '',
+    color: row.color || '',
+    onlyToday: Boolean(row.only_today),
+  };
+}
+
+function formatMarketSettingsBlock(title, s) {
+  if (!s) {
+    return `${title}:\nтут пока что пусто`;
+  }
+  return (
+    `${title}:\n` +
+    `1) Запрос: ${s.query || '—'}\n` +
+    `2) Модель: ${s.extraKeywords || '—'}\n` +
+    `3) Город: ${s.city || '—'}\n` +
+    `4) Цена: ${s.minPrice || 0} - ${s.maxPrice || 0}\n` +
+    `5) Память: ${s.memory || '—'}\n` +
+    `6) Цвет: ${s.color || '—'}\n` +
+    `7) Только сегодня: ${s.onlyToday ? 'ДА' : 'НЕТ'}`
+  );
 }
 
 async function supabaseUpsertExcelFile({ telegramUserId, fileName, filePath, marketplace }) {
@@ -707,49 +804,23 @@ async function handleMessage(msg) {
 
   if (text === MENU.autoSettings) {
     try {
-      const saved = await supabaseFetchUserSettings(msg.from?.id);
-      if (saved) {
-        state.settings.query = saved.query || state.settings.query;
-        state.settings.extraKeywords = saved.extra_keywords || '';
-        state.settings.city = saved.city || state.settings.city;
-        state.settings.marketplaceDefault = saved.marketplace_default || 'avito';
-        state.settings.minPrice = Number(saved.min_price || 0);
-        state.settings.maxPrice = Number(saved.max_price || 0);
-        state.settings.priceFilterEnabled = state.settings.minPrice > 0 || state.settings.maxPrice > 0;
-        state.settings.memoryGb = saved.memory || '';
-        state.settings.memoryFilterEnabled = Boolean(state.settings.memoryGb);
-        state.settings.color = saved.color || '';
-        state.settings.colorFilterEnabled = Boolean(state.settings.color);
-        state.settings.onlyToday = Boolean(saved.only_today);
-        state.settings.sellerType = saved.seller_type || 'any';
-        state.settings.minRating = Number(saved.min_rating || 0);
-        await sendMessage(
-          chatId,
-          `⚙️ Ваши сохраненные настройки:\n` +
-            `• Запрос: ${state.settings.query}\n` +
-            `• Модель: ${state.settings.extraKeywords || '—'}\n` +
-            `• Город: ${state.settings.city || '—'}\n` +
-            `• Цена: ${state.settings.minPrice || 0} - ${state.settings.maxPrice || 0}\n` +
-            `• Память: ${state.settings.memoryGb || '—'}\n` +
-            `• Цвет: ${state.settings.color || '—'}\n` +
-            `• Только сегодня: ${state.settings.onlyToday ? 'ДА' : 'НЕТ'}`,
-          {
-            keyboard: [[{ text: SETTINGS_EDIT }], [{ text: MENU.backToMenu }]],
-            resize_keyboard: true,
-            one_time_keyboard: false,
-          }
-        );
-      } else {
-        await sendMessage(
-          chatId,
-          '⚙️ Сохраненных настроек нет. Давайте заполним по шагам.',
-          {
-            keyboard: [[{ text: SETTINGS_EDIT }], [{ text: MENU.backToMenu }]],
-            resize_keyboard: true,
-            one_time_keyboard: false,
-          }
-        );
-      }
+      const rows = await supabaseFetchMarketSettingsAll(msg.from?.id);
+      const avitoRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'avito');
+      const wbRow = rows.find((r) => String(r.marketplace || '').toLowerCase() === 'wb');
+      state.marketSettings.avito = avitoRow ? mapRowToMarketSettings(avitoRow) : null;
+      state.marketSettings.wb = wbRow ? mapRowToMarketSettings(wbRow) : null;
+
+      await sendMessage(
+        chatId,
+        `⚙️ Ваши настройки площадок:\n\n` +
+          `${formatMarketSettingsBlock('🛒 Настройки Авито', state.marketSettings.avito)}\n\n` +
+          `${formatMarketSettingsBlock('🛍️ Настройки ВБ', state.marketSettings.wb)}`,
+        {
+          keyboard: [[{ text: SETTINGS_AVITO }, { text: SETTINGS_WB }], [{ text: MENU.backToMenu }]],
+          resize_keyboard: true,
+          one_time_keyboard: false,
+        }
+      );
     } catch (e) {
       await sendMessage(chatId, `⚠️ Ошибка чтения настроек: ${String(e?.message || e || '')}`, mainKeyboard);
     }
@@ -792,49 +863,65 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (text === MENU.backToMenu) {
-    state.stage = 'main';
-    await sendMessage(chatId, 'Ок, меню.', mainKeyboard);
+  if (text === SETTINGS_AVITO || text === SETTINGS_WB || text === SETTINGS_EDIT) {
+    state.configureOnly = true;
+    const m = text === SETTINGS_WB ? 'wb' : 'avito';
+    const current = m === 'wb' ? state.marketSettings.wb : state.marketSettings.avito;
+    state.runDraft = {
+      marketplace: m,
+      query: current?.query || 'iPhone',
+      extraKeywords: current?.extraKeywords || '',
+      city: current?.city || 'moskva',
+      minPrice: Number(current?.minPrice || 0),
+      maxPrice: Number(current?.maxPrice || 0),
+      memory: current?.memory || '',
+      onlyToday: Boolean(current?.onlyToday),
+      color: current?.color || '',
+    };
+    state.stage = 'run_query';
+    await sendMessage(chatId, `⚙️ Настройка ${m === 'avito' ? 'Авито' : 'ВБ'}.\n📝 Шаг 1: Введите название поиска (например: iPhone):`, { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
     return;
   }
 
-  if (text === SETTINGS_EDIT) {
-    state.configureOnly = true;
-    state.stage = 'choosing_market';
+  if (text === MENU.backToMenu) {
+    state.stage = 'main';
+    state.configureOnly = false;
     state.runDraft = null;
-    await sendMessage(chatId, '⚙️ Выберите площадку для настройки:', buildMarketplaceKeyboard());
+    await sendMessage(chatId, '⬅️ Возврат в меню.', mainKeyboard);
     return;
   }
 
   // Stage: choosing marketplace
   if (state.stage === 'choosing_market') {
     if (text === '🛒 Авито' || text === 'Авито') {
+      const av = state.marketSettings.avito;
       state.runDraft = {
         marketplace: 'avito',
-        query: state.settings.query || '',
-        extraKeywords: state.settings.extraKeywords || '',
-        city: state.settings.city || 'moskva',
-        minPrice: 0,
-        maxPrice: 0,
-        memory: '',
-        onlyToday: false,
-        color: '',
+        query: av?.query || 'iPhone',
+        extraKeywords: av?.extraKeywords || '',
+        city: av?.city || 'moskva',
+        minPrice: Number(av?.minPrice || 0),
+        maxPrice: Number(av?.maxPrice || 0),
+        memory: av?.memory || '',
+        onlyToday: Boolean(av?.onlyToday),
+        color: av?.color || '',
       };
       state.stage = 'run_query';
       await sendMessage(chatId, '📝 Шаг 1/7: Введите название поиска (например: iPhone):', { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
       return;
     }
     if (text === '🛍️ ВБ' || text === 'ВБ') {
+      const wb = state.marketSettings.wb;
       state.runDraft = {
         marketplace: 'wb',
-        query: state.settings.query || '',
-        extraKeywords: state.settings.extraKeywords || '',
-        city: state.settings.city || 'moskva',
-        minPrice: 0,
-        maxPrice: 0,
-        memory: '',
-        onlyToday: false,
-        color: '',
+        query: wb?.query || 'iPhone',
+        extraKeywords: wb?.extraKeywords || '',
+        city: wb?.city || 'moskva',
+        minPrice: Number(wb?.minPrice || 0),
+        maxPrice: Number(wb?.maxPrice || 0),
+        memory: wb?.memory || '',
+        onlyToday: Boolean(wb?.onlyToday),
+        color: wb?.color || '',
       };
       state.stage = 'run_query';
       await sendMessage(chatId, '📝 Шаг 1/7: Введите название поиска (например: iPhone):', { keyboard: [[{ text: WIZARD_SKIP }]], resize_keyboard: true, one_time_keyboard: false });
@@ -930,7 +1017,13 @@ async function handleMessage(msg) {
   if (state.stage === 'run_only_today') {
     state.runDraft.onlyToday = text === WIZARD_YES;
     state.stage = 'run_confirm';
-    await sendMessage(chatId, '✅ Шаг 8/8: Запустить парсинг с этими настройками?', { keyboard: [[{ text: WIZARD_START }, { text: MENU.backToMenu }]], resize_keyboard: true, one_time_keyboard: false });
+    await sendMessage(
+      chatId,
+      state.configureOnly
+        ? '💾 Шаг 8/8: Сохранить настройки этой площадки?'
+        : '✅ Шаг 8/8: Запустить парсинг с этими настройками?',
+      confirmKeyboard(state.configureOnly)
+    );
     return;
   }
 
@@ -942,19 +1035,31 @@ async function handleMessage(msg) {
     }
     state.runDraft.color = '';
     state.stage = 'run_confirm';
-    await sendMessage(chatId, '✅ Шаг 7/7: Запустить парсинг с этими настройками?', { keyboard: [[{ text: WIZARD_START }, { text: MENU.backToMenu }]], resize_keyboard: true, one_time_keyboard: false });
+    await sendMessage(
+      chatId,
+      state.configureOnly
+        ? '💾 Шаг 7/7: Сохранить настройки этой площадки?'
+        : '✅ Шаг 7/7: Запустить парсинг с этими настройками?',
+      confirmKeyboard(state.configureOnly)
+    );
     return;
   }
 
   if (state.stage === 'run_color_value') {
     state.runDraft.color = COLOR_BUTTONS.includes(text) ? text : '';
     state.stage = 'run_confirm';
-    await sendMessage(chatId, '✅ Шаг 7/7: Запустить парсинг с этими настройками?', { keyboard: [[{ text: WIZARD_START }, { text: MENU.backToMenu }]], resize_keyboard: true, one_time_keyboard: false });
+    await sendMessage(
+      chatId,
+      state.configureOnly
+        ? '💾 Шаг 7/7: Сохранить настройки этой площадки?'
+        : '✅ Шаг 7/7: Запустить парсинг с этими настройками?',
+      confirmKeyboard(state.configureOnly)
+    );
     return;
   }
 
   if (state.stage === 'run_confirm') {
-    if (text === WIZARD_START) {
+    if (text === WIZARD_START || (state.configureOnly && text === SETTINGS_SAVE)) {
       const d = state.runDraft || {};
       // Persist settings in DB and in-memory profile
       state.settings.marketplaceDefault = d.marketplace || 'avito';
@@ -971,7 +1076,9 @@ async function handleMessage(msg) {
       state.settings.colorFilterEnabled = Boolean(state.settings.color);
 
       try {
-        await supabaseUpsertUserSettings(msg.from?.id, state.settings);
+        if (d.marketplace === 'avito') state.marketSettings.avito = { ...d };
+        if (d.marketplace === 'wb') state.marketSettings.wb = { ...d };
+        await supabaseUpsertMarketSettings(msg.from?.id, d.marketplace || 'avito', d);
       } catch (e) {
         console.error('Supabase settings upsert error:', String(e?.message || e || ''));
       }
@@ -979,7 +1086,15 @@ async function handleMessage(msg) {
       state.stage = 'main';
       if (state.configureOnly) {
         state.configureOnly = false;
-        await sendMessage(chatId, '✅ Настройки сохранены в БД.', mainKeyboard);
+        await sendMessage(
+          chatId,
+          `✅ Настройки ${d.marketplace === 'wb' ? 'ВБ' : 'Авито'} сохранены в БД.`,
+          {
+            keyboard: [[{ text: SETTINGS_AVITO }, { text: SETTINGS_WB }], [{ text: MENU.backToMenu }]],
+            resize_keyboard: true,
+            one_time_keyboard: false,
+          }
+        );
         return;
       }
 
@@ -1007,7 +1122,13 @@ async function handleMessage(msg) {
       await sendMessage(chatId, '⬅️ Возврат в меню.', mainKeyboard);
       return;
     }
-    await sendMessage(chatId, 'Нажми `Запустить парсинг` или `Назад`.', { keyboard: [[{ text: WIZARD_START }, { text: MENU.backToMenu }]], resize_keyboard: true, one_time_keyboard: false });
+    await sendMessage(
+      chatId,
+      state.configureOnly
+        ? 'Нажми `Сохранить настройки` или `Назад`.'
+        : 'Нажми `Запустить парсинг` или `Назад`.',
+      confirmKeyboard(state.configureOnly)
+    );
     return;
   }
 
