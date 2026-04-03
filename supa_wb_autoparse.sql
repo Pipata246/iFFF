@@ -5,6 +5,7 @@ create table if not exists public.wb_autoparse_state (
   telegram_user_id text primary key,
   interval_minutes int not null default 30 check (interval_minutes >= 5 and interval_minutes <= 180),
   enabled boolean not null default true,
+  save_excel boolean not null default true,
   is_running boolean not null default false,
   baseline_ready boolean not null default false,
   settings_fingerprint text not null default '',
@@ -43,3 +44,7 @@ alter table public.wb_seen_listings disable row level security;
 
 grant select, insert, update, delete on public.wb_autoparse_state to anon;
 grant select, insert, update, delete on public.wb_seen_listings to anon;
+
+-- Backward-compatibility for existing installs (when table already created before this field existed):
+alter table public.wb_autoparse_state
+  add column if not exists save_excel boolean not null default true;

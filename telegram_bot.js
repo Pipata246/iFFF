@@ -64,6 +64,8 @@ const AUTO_EDIT_WB = '✏️ ВБ — изменить фильтры';
 const AUTO_BACK_TO_AUTO_MAIN = '⬅️ К настройкам автопарсинга';
 const AUTO_WB_ENABLED = '✅ Автопарсинг ВКЛ';
 const AUTO_WB_DISABLED = '⏸ Автопарсинг ВЫКЛ';
+const AUTO_WB_EXCEL_ON = '📊 Сохранять Excel: ВКЛ';
+const AUTO_WB_EXCEL_OFF = '📊 Сохранять Excel: ВЫКЛ';
 
 const STOP_PARSING_TEXT = '⛔ Остановить парсинг';
 
@@ -238,6 +240,8 @@ function getUserState(chatId) {
         wb: null,
       },
       returnToAutoFiltersHub: false,
+      /** Ручной запуск «задать вручную» — не писать настройки в БД автопарсинга. */
+      manualRunEphemeral: false,
     });
   }
   return userStateByChatId.get(chatId);
@@ -648,7 +652,7 @@ async function supabaseFetchWbAutoparseState(tgUserId) {
   const qs = new URLSearchParams({
     telegram_user_id: `eq.${String(tgUserId)}`,
     select:
-      'telegram_user_id,interval_minutes,enabled,is_running,baseline_ready,settings_fingerprint,last_run_started_at,last_run_finished_at,last_run_ok,next_scheduled_at',
+      'telegram_user_id,interval_minutes,enabled,save_excel,is_running,baseline_ready,settings_fingerprint,last_run_started_at,last_run_finished_at,last_run_ok,next_scheduled_at',
     limit: '1',
   });
   const resp = await fetch(`${SUPABASE_URL}/rest/v1/wb_autoparse_state?${qs.toString()}`, {
@@ -809,11 +813,14 @@ async function supabaseResetAllWbAutoparseRunning() {
   }
 }
 
-function buildAutoSettingsMainKeyboard() {
+function buildAutoSettingsMainKeyboard(st) {
+  const saveExcelEnabled = st == null ? true : st.save_excel !== false;
+  const excelText = saveExcelEnabled ? AUTO_WB_EXCEL_ON : AUTO_WB_EXCEL_OFF;
   return {
     keyboard: [
       [{ text: AUTO_WB_FILTERS }],
       [{ text: AUTO_WB_INTERVAL }],
+      [{ text: excelText }],
       [{ text: MENU.backToMenu }],
     ],
     resize_keyboard: true,
@@ -934,7 +941,7 @@ function buildParserEnvForRun({ chatId, marketplace, settings, parserOverrides =
  * Завершение тихого автопарсинга ВБ: база при первом запуске, уведомления о новых позже.
  * @param {number} intervalMinutes — интервал до следующего запуска из настроек
  */
-async function processWbAutoparseResult(chatId, exitCode, snapshotPath, intervalMinutes, stopped) {
+async function processWbAutoparseResult(chatId, exitCode, snapshotPath, intervalMinutes, stopped, createdExcelFiles = []) {
   const interval = Number.isFinite(Number(intervalMinutes)) && Number(intervalMinutes) > 0 ? Number(intervalMinutes) : 30;
   const nextIso = new Date(Date.now() + interval * 60_000).toISOString();
 
@@ -964,6 +971,17 @@ async function processWbAutoparseResult(chatId, exitCode, snapshotPath, interval
     next_scheduled_at: nextIso,
   });
 
+  let rowState = null;
+  try {
+    rowState = await supabaseFetchWbAutoparseState(chatId);
+  } catch (_) {
+    rowState = null;
+  }
+  const saveExcelEnabled = rowState == null ? true : rowState.save_excel !== false;
+  if (!saveExcelEnabled && Array.isArray(createdExcelFiles) && createdExcelFiles.length > 0) {
+    for (const fp of createdExcelFiles) safeUnlink(fp);
+  }
+
   if (exitCode !== 0 || !snapshotPath || !fs.existsSync(snapshotPath)) {
     safeUnlink(snapshotPath);
     return;
@@ -989,12 +1007,6 @@ async function processWbAutoparseResult(chatId, exitCode, snapshotPath, interval
   const list = [...dedup.values()];
   const ids = [...dedup.keys()];
 
-  let rowState = null;
-  try {
-    rowState = await supabaseFetchWbAutoparseState(chatId);
-  } catch (_) {
-    rowState = null;
-  }
   const baselineReady = Boolean(rowState?.baseline_ready);
 
   if (!baselineReady) {
@@ -1162,8 +1174,10 @@ async function runParserForMarketplace({
     stopRequestedByChatId.delete(chatId);
 
     if (wbAutoparseHook && marketplace === 'wb') {
+      const afterFiles = listExcelFilesOnServer();
+      const newOnes = afterFiles.filter((f) => !beforePaths.has(f.filePath));
       try {
-        await wbAutoparseHook(code, stopped);
+        await wbAutoparseHook(code, stopped, newOnes);
       } catch (e) {
         console.error('wbAutoparseHook error:', String(e?.message || e || ''));
       }
@@ -1260,14 +1274,13 @@ async function tickWbAutoparseScheduler() {
     });
 
     const st = await supabaseFetchWbAutoparseState(chatId).catch(() => null);
-    if (st && st.settings_fingerprint && st.settings_fingerprint !== fp) {
+    const storedFp = st?.settings_fingerprint || '';
+    if (storedFp !== fp) {
       await supabaseDeleteWbSeenListings(chatId);
       await supabaseUpsertWbAutoparseState(chatId, {
         baseline_ready: false,
         settings_fingerprint: fp,
       });
-    } else if (!st?.settings_fingerprint) {
-      await supabaseUpsertWbAutoparseState(chatId, { settings_fingerprint: fp });
     }
 
     const snapshotPath = path.join(PROJECT_DIR, `.wb_snap_${chatId}_${Date.now()}.json`);
@@ -1297,8 +1310,15 @@ async function tickWbAutoparseScheduler() {
       parserOverrides,
       silent: true,
       wbSnapshotPath: snapshotPath,
-      wbAutoparseHook: async (exitCode, stopped) => {
-        await processWbAutoparseResult(chatId, exitCode, snapshotPath, intervalMinutes, stopped);
+      wbAutoparseHook: async (exitCode, stopped, newExcelFiles) => {
+        await processWbAutoparseResult(
+          chatId,
+          exitCode,
+          snapshotPath,
+          intervalMinutes,
+          stopped,
+          (newExcelFiles || []).map((f) => f.filePath)
+        );
       },
     });
   } catch (e) {
@@ -1389,6 +1409,7 @@ async function handleMessage(msg) {
       state.selectedMarketplace = null;
       state.launchMode = false;
       state.excelDeleteCandidates = [];
+      state.manualRunEphemeral = false;
       state.returnToAutoFiltersHub = false;
       try {
         await sendAutoFiltersHubScreen(chatId, msg.from?.id, '❌ Мастер отменён.');
@@ -1404,6 +1425,7 @@ async function handleMessage(msg) {
     state.selectedMarketplace = null;
     state.launchMode = false;
     state.excelDeleteCandidates = [];
+    state.manualRunEphemeral = false;
     await sendMessage(chatId, '❌ Отменено. Возврат в главное меню.', mainKeyboard);
     return;
   }
@@ -1551,13 +1573,14 @@ async function handleMessage(msg) {
 
   if (text === MENU.autoSettings) {
     state.stage = 'auto_settings_main';
+    const st = await supabaseFetchWbAutoparseState(msg.from?.id).catch(() => null);
     await sendMessage(
       chatId,
       '⚙️ *Настройки автопарсинга*\n\n' +
         '*Wildberries:* по расписанию собирает выдачу; первый прогон создаёт базу без уведомлений, затем приходят только *новые* объявления.\n\n' +
         '*Фильтры:* для Авито и ВБ хранятся отдельно — задайте их в пункте «Настроить фильтры».\n\n' +
         'Выберите действие:',
-      buildAutoSettingsMainKeyboard(),
+      buildAutoSettingsMainKeyboard(st),
       'Markdown'
     );
     return;
@@ -1586,6 +1609,7 @@ async function handleMessage(msg) {
       if (st) {
         lines.push(`\n⏱ Интервал: ${st.interval_minutes || 30} мин`);
         lines.push(st.enabled === false ? '\n⏸ Расписание: *выключено*' : '\n▶️ Расписание: *включено*');
+        lines.push(st.save_excel === false ? '\n📊 Сохранение Excel: *ВЫКЛ*' : '\n📊 Сохранение Excel: *ВКЛ*');
         lines.push(`\n🕐 Последний старт: ${fmt(st.last_run_started_at)}`);
         const okTag =
           st.last_run_ok === false ? ' (с ошибкой)' : st.last_run_ok === true ? ' (успех)' : '';
@@ -1611,6 +1635,26 @@ async function handleMessage(msg) {
     if (text === AUTO_WB_FILTERS) {
       try {
         await sendAutoFiltersHubScreen(chatId, msg.from?.id);
+      } catch (e) {
+        await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoSettingsMainKeyboard());
+      }
+      return;
+    }
+    if (text === AUTO_WB_EXCEL_ON || text === AUTO_WB_EXCEL_OFF) {
+      try {
+        const st = await supabaseFetchWbAutoparseState(msg.from?.id);
+        const current = st == null ? true : st.save_excel !== false;
+        const next = !current;
+        await supabaseUpsertWbAutoparseState(msg.from?.id, { save_excel: next });
+        const updated = await supabaseFetchWbAutoparseState(msg.from?.id);
+        await sendMessage(
+          chatId,
+          next
+            ? '✅ Сохранение Excel для автопарсинга ВБ: *ВКЛ*.'
+            : '✅ Сохранение Excel для автопарсинга ВБ: *ВЫКЛ*.',
+          buildAutoSettingsMainKeyboard(updated),
+          'Markdown'
+        );
       } catch (e) {
         await sendMessage(chatId, `⚠️ ${String(e?.message || e || '')}`, buildAutoSettingsMainKeyboard());
       }
@@ -1858,6 +1902,7 @@ async function handleMessage(msg) {
   if (state.stage === 'run_mode_choice') {
     const m = state.selectedMarketplaceForRun || 'avito';
     if (text === RUN_SET_MANUAL) {
+      state.manualRunEphemeral = true;
       const current = m === 'wb' ? state.marketSettings.wb : state.marketSettings.avito;
       state.runDraft = {
         marketplace: m,
@@ -1880,6 +1925,7 @@ async function handleMessage(msg) {
     }
 
     if (text === RUN_CONTINUE_AUTO) {
+      state.manualRunEphemeral = false;
       // pull latest settings from DB for selected marketplace
       try {
         const rows = await supabaseFetchMarketSettingsAll(msg.from?.id);
@@ -1924,6 +1970,7 @@ async function handleMessage(msg) {
     if (text === MENU.backToMenu) {
       state.stage = 'main';
       state.selectedMarketplaceForRun = null;
+      state.manualRunEphemeral = false;
       await sendMessage(chatId, '⬅️ Возврат в меню.', mainKeyboard);
       return;
     }
@@ -2066,26 +2113,29 @@ async function handleMessage(msg) {
   if (state.stage === 'run_confirm') {
     if (text === WIZARD_START || (state.configureOnly && text === SETTINGS_SAVE)) {
       const d = state.runDraft || {};
-      // Persist settings in DB and in-memory profile
-      state.settings.marketplaceDefault = d.marketplace || 'avito';
-      state.settings.query = d.query || 'iPhone';
-      state.settings.extraKeywords = d.extraKeywords || '';
-      state.settings.city = d.city || state.settings.city || 'moskva';
-      state.settings.minPrice = Number(d.minPrice || 0);
-      state.settings.maxPrice = Number(d.maxPrice || 0);
-      state.settings.priceFilterEnabled = state.settings.minPrice > 0 || state.settings.maxPrice > 0;
-      state.settings.memoryGb = d.memory || '';
-      state.settings.memoryFilterEnabled = Boolean(state.settings.memoryGb);
-      state.settings.onlyToday = Boolean(d.onlyToday);
-      state.settings.color = d.color || '';
-      state.settings.colorFilterEnabled = Boolean(state.settings.color);
+      const ephemeralManual = Boolean(state.manualRunEphemeral && !state.configureOnly);
 
-      try {
-        if (d.marketplace === 'avito') state.marketSettings.avito = { ...d };
-        if (d.marketplace === 'wb') state.marketSettings.wb = { ...d };
-        await supabaseUpsertMarketSettings(msg.from?.id, d.marketplace || 'avito', d);
-      } catch (e) {
-        console.error('Supabase settings upsert error:', String(e?.message || e || ''));
+      if (!ephemeralManual) {
+        state.settings.marketplaceDefault = d.marketplace || 'avito';
+        state.settings.query = d.query || 'iPhone';
+        state.settings.extraKeywords = d.extraKeywords || '';
+        state.settings.city = d.city || state.settings.city || 'moskva';
+        state.settings.minPrice = Number(d.minPrice || 0);
+        state.settings.maxPrice = Number(d.maxPrice || 0);
+        state.settings.priceFilterEnabled = state.settings.minPrice > 0 || state.settings.maxPrice > 0;
+        state.settings.memoryGb = d.memory || '';
+        state.settings.memoryFilterEnabled = Boolean(state.settings.memoryGb);
+        state.settings.onlyToday = Boolean(d.onlyToday);
+        state.settings.color = d.color || '';
+        state.settings.colorFilterEnabled = Boolean(state.settings.color);
+
+        try {
+          if (d.marketplace === 'avito') state.marketSettings.avito = { ...d };
+          if (d.marketplace === 'wb') state.marketSettings.wb = { ...d };
+          await supabaseUpsertMarketSettings(msg.from?.id, d.marketplace || 'avito', d);
+        } catch (e) {
+          console.error('Supabase settings upsert error:', String(e?.message || e || ''));
+        }
       }
 
       state.stage = 'main';
@@ -2094,10 +2144,11 @@ async function handleMessage(msg) {
         const backAuto = state.returnToAutoFiltersHub;
         state.returnToAutoFiltersHub = false;
         if (backAuto && d.marketplace === 'wb') {
+          let wbNotice = '✅ Фильтры Wildberries сохранены в БД.\n\n';
           try {
             const prev = await supabaseFetchWbAutoparseState(msg.from?.id);
             const fp = wbSettingsFingerprintFromDraft(d);
-            const fpChanged = Boolean(prev?.settings_fingerprint && prev.settings_fingerprint !== fp);
+            const fpChanged = (prev?.settings_fingerprint || '') !== fp;
             if (fpChanged) {
               await supabaseDeleteWbSeenListings(msg.from?.id);
             }
@@ -2108,14 +2159,19 @@ async function handleMessage(msg) {
               enabled: prev == null ? true : prev.enabled !== false,
               next_scheduled_at: new Date().toISOString(),
             });
+            if (fpChanged) {
+              wbNotice +=
+                '📭 База объявлений для автопарсинга очищена.\n\n' +
+                'Следующий автозапуск Wildberries создаст новую базу объявлений (по этому прогону уведомлений не будет). После этого снова будут приходить только новые позиции.';
+            } else {
+              wbNotice +=
+                'Набор фильтров не менялся — таблица «уже виденных» объявлений не сбрасывалась.';
+            }
           } catch (e) {
             console.error('wb_autoparse on filter save:', String(e?.message || e || ''));
+            wbNotice += '⚠️ Не удалось обновить состояние автопарсинга в БД — см. логи сервера.';
           }
-          await sendAutoFiltersHubScreen(
-            chatId,
-            msg.from?.id,
-            '✅ Фильтры Wildberries сохранены в БД.\n\nЕсли фильтры изменились — база сравнения сброшена; первый прогон снова создаст базу без уведомлений.'
-          );
+          await sendAutoFiltersHubScreen(chatId, msg.from?.id, wbNotice);
           return;
         }
         if (backAuto && d.marketplace === 'avito') {
@@ -2134,6 +2190,7 @@ async function handleMessage(msg) {
         return;
       }
 
+      state.manualRunEphemeral = false;
       await runParserForMarketplace({
         chatId,
         marketplace: d.marketplace || 'avito',
@@ -2156,6 +2213,7 @@ async function handleMessage(msg) {
         state.returnToAutoFiltersHub = false;
         state.runDraft = null;
         state.configureOnly = false;
+        state.manualRunEphemeral = false;
         try {
           await sendAutoFiltersHubScreen(chatId, msg.from?.id);
         } catch (e) {
@@ -2166,6 +2224,7 @@ async function handleMessage(msg) {
       state.stage = 'main';
       state.runDraft = null;
       state.configureOnly = false;
+      state.manualRunEphemeral = false;
       await sendMessage(chatId, '⬅️ Возврат в меню.', mainKeyboard);
       return;
     }
