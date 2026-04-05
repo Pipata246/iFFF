@@ -1,17 +1,44 @@
 /**
- * Однократно: войти на wildberries.ru в Chromium и сохранить cookies/localStorage
- * в JSON для PARSER_WB_STORAGE_STATE (чтобы парсер видел цены с WB Кошельком).
+ * Однократно: войти на wildberries.ru и сохранить cookies/localStorage в JSON для PARSER_WB_STORAGE_STATE.
  *
- * Локально (окно браузера):
- *   npm run wb:save-session
- *   или: PLAYWRIGHT_HEADLESS=0 node save_wb_storage_state.js /путь/wb_storage.json
+ * Wildberries часто блокирует встроенный Chromium Playwright («подозрительная активность»).
+ * По умолчанию на Windows/macOS открывается установленный Google Chrome (меньше ложных блокировок).
  *
- * На VPS лучше сохранить сессию там же (тот же IP/прокси, что у парсера), иначе WB может сбросить вход.
+ * PowerShell (без прокси из browser.js — как в прошлой инструкции):
+ *   $env:AVITO_NO_PROXY="1"; $env:PLAYWRIGHT_HEADLESS="0"; npm run wb:save-session
+ *
+ * Если Chrome нет — встроенный Chromium:
+ *   $env:WB_SESSION_CHANNEL="chromium"; ...
+ *
+ * Вместо Chrome — системный Edge:
+ *   $env:WB_SESSION_CHANNEL="msedge"; ...
+ *
+ * Если WB всё равно блокирует — вариант без «ботового» запуска: свой Chrome + отладка, см. save_wb_storage_cdp.js и npm run wb:save-session-cdp
  */
 
 const readline = require('readline');
 const path = require('path');
 const { launchBrowser, newStealthContext } = require('./browser');
+
+/**
+ * @returns {string|undefined} channel для Playwright или undefined = bundled Chromium
+ */
+function pickWbSessionChannel() {
+  const raw = String(process.env.WB_SESSION_CHANNEL || '').trim().toLowerCase();
+  if (raw === '0' || raw === 'chromium' || raw === 'bundled' || raw === 'playwright') {
+    return undefined;
+  }
+  if (raw === 'edge' || raw === 'msedge') {
+    return 'msedge';
+  }
+  if (raw === 'chrome') {
+    return 'chrome';
+  }
+  if (process.platform === 'win32' || process.platform === 'darwin') {
+    return 'chrome';
+  }
+  return undefined;
+}
 
 async function main() {
   const outArg = process.argv[2] || 'wb_storage.json';
@@ -21,12 +48,38 @@ async function main() {
     process.env.PLAYWRIGHT_HEADLESS = '0';
   }
 
-  console.log(
-    'Откроется Chromium. Войдите в аккаунт Wildberries (и при необходимости откройте любой товар и проверьте цену с кошельком).'
-  );
-  console.log('Используйте тот же режим прокси, что у парсера (или без прокси — как в .env при сохранении).\n');
+  const channel = pickWbSessionChannel();
+  if (channel) {
+    console.log(`Будет использован системный браузер (channel=${channel}), не встроенный Chromium Playwright.\n`);
+  } else {
+    console.log('Будет использован встроенный Chromium Playwright (если WB пишет «подозрительная активность» — см. шапку файла).\n');
+  }
 
-  const browser = await launchBrowser();
+  console.log(
+    'Войдите в Wildberries. Если видите «Подозрительная активность» и таймер — дождитесь окончания и обновления страницы.'
+  );
+  console.log('Иногда помогает: другой браузер (WB_SESSION_CHANNEL=msedge), другой интернет или повтор через 10–30 минут.\n');
+
+  if (!(process.env.AVITO_NO_PROXY === '1' || process.env.AVITO_NO_PROXY === 'true')) {
+    console.log(
+      'Подсказка: с домашнего интернета часто нужен прокси OFF для этого шага (таймауты). Парсер на VPS прокси не трогайте.\n'
+    );
+    console.log('  $env:AVITO_NO_PROXY="1"; $env:PLAYWRIGHT_HEADLESS="0"; npm run wb:save-session\n');
+  }
+
+  let browser;
+  try {
+    browser = channel ? await launchBrowser({ channel }) : await launchBrowser();
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    if (channel) {
+      console.warn(`Запуск с channel=${channel} не удался (${msg}). Пробуем встроенный Chromium…\n`);
+      browser = await launchBrowser();
+    } else {
+      throw e;
+    }
+  }
+
   const context = await newStealthContext(browser);
   const page = await context.newPage();
   try {
@@ -40,7 +93,7 @@ async function main() {
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   await new Promise((resolve) => {
-    rl.question('Нажмите Enter здесь после успешного входа на WB… ', () => {
+    rl.question('Нажмите Enter здесь после успешного входа и проверки цены с кошельком… ', () => {
       rl.close();
       resolve();
     });
@@ -49,7 +102,7 @@ async function main() {
   await context.storageState({ path: outAbs });
   await browser.close();
   console.log('\nСохранено:', outAbs);
-  console.log('В .env укажите (на VPS — абсолютный путь, chmod 600):');
+  console.log('В .env на VPS:');
   console.log(`PARSER_WB_STORAGE_STATE=${outAbs}`);
 }
 

@@ -8,6 +8,7 @@
  *   $env:WB_SKIP_HOME_WARMUP=1 — Wildberries: не заходить сначала на главную (wb_runner.js), только пауза и сразу URL поиска.
  *   $env:PARSER_WB_STORAGE_STATE=wb_storage.json — файл сессии после входа на wildberries.ru (цены с WB Кошельком).
  *     Создать: PLAYWRIGHT_HEADLESS=0 npm run wb:save-session
+ *   $env:WB_SESSION_CHANNEL=chrome|msedge|chromium — для save_wb_storage_state.js (см. файл).
  */
 
 const fs = require('fs');
@@ -82,9 +83,10 @@ function getProxyOptions() {
 
 /**
  * Запуск Chromium без прокси на процессе — прокси в newContext (см. newStealthContext).
+ * @param {import('playwright').LaunchOptions} [overrides] — например { channel: 'chrome' } для save_wb_storage_state.js
  * @returns {Promise<import('playwright').Browser>}
  */
-async function launchBrowser() {
+async function launchBrowser(overrides = {}) {
   /** @type {import('playwright').LaunchOptions} */
   const launchOpts = {
     // VPS запуск: браузер не должен отображаться (headless по умолчанию).
@@ -101,6 +103,7 @@ async function launchBrowser() {
       '--ignore-certificate-errors-spki-list',
     ],
     ignoreDefaultArgs: ['--enable-automation'],
+    ...overrides,
   };
 
   const p = getProxyOptions().proxy;
