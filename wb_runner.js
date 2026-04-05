@@ -3,7 +3,8 @@
  */
 
 const readline = require('readline');
-const { launchBrowser, newStealthContext, isProxyDisabled, PROXY_URL } = require('./browser');
+const path = require('path');
+const { launchBrowser, newStealthContext, isProxyDisabled, PROXY_URL, resolveWbStorageStatePath } = require('./browser');
 const {
   log,
   logStep,
@@ -741,9 +742,20 @@ async function runAttemptWb(params, opts = {}) {
     }
   }
   const browser = await launchBrowser();
-  const context = await newStealthContext(browser);
+  const context = await newStealthContext(browser, { wbUseSavedSession: true });
   const page = await context.newPage();
   domGateCtx.page = page;
+
+  const wbStateRaw = String(process.env.PARSER_WB_STORAGE_STATE || '').trim();
+  const wbStatePath = resolveWbStorageStatePath(process.env.PARSER_WB_STORAGE_STATE);
+  if (wbStatePath) {
+    log(`  WB: сессия авторизации загружена — в карточках должна быть цена с WB Кошельком (если кошелёк активен).`);
+  } else if (wbStateRaw) {
+    const tried = path.isAbsolute(wbStateRaw) ? wbStateRaw : path.join(process.cwd(), wbStateRaw);
+    log(`  WB: PARSER_WB_STORAGE_STATE задан, но файл не найден (${tried}) — парсинг как у гостя (без цены с кошельком).`);
+  } else {
+    log(`  WB: сессия не задана (PARSER_WB_STORAGE_STATE) — без входа цена с кошельком на сайте не показывается.`);
+  }
 
   await waitProxyManualGate();
 

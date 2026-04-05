@@ -7,6 +7,7 @@
     "start": "node main.js",
     "start:vps": "NODE_OPTIONS=--max-old-space-size=384 node main.js",
     "bot": "node telegram_bot.js",
+    "wb:save-session": "node save_wb_storage_state.js",
     "postinstall": "playwright install chromium"
   },
   "engines": {

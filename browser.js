@@ -6,8 +6,12 @@
  *   $env:AVITO_MANUAL_PROXY=1 — см. main.js: сначала ручной вход на сайте провайдера, затем Enter.
  *   $env:AVITO_PROXY_ON_LAUNCH=1 — прокси на chromium.launch вместо newContext (если ERR_CONNECTION_CLOSED через контекст).
  *   $env:WB_SKIP_HOME_WARMUP=1 — Wildberries: не заходить сначала на главную (wb_runner.js), только пауза и сразу URL поиска.
+ *   $env:PARSER_WB_STORAGE_STATE=wb_storage.json — файл сессии после входа на wildberries.ru (цены с WB Кошельком).
+ *     Создать: PLAYWRIGHT_HEADLESS=0 npm run wb:save-session
  */
 
+const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
 const {
   pickUserAgent,
@@ -108,10 +112,23 @@ async function launchBrowser() {
 }
 
 /**
+ * Путь к JSON сессии WB (cookies + localStorage) для Playwright storageState.
+ * @param {string} raw из PARSER_WB_STORAGE_STATE
+ * @returns {string|null} абсолютный путь или null
+ */
+function resolveWbStorageStatePath(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  const abs = path.isAbsolute(s) ? s : path.join(process.cwd(), s);
+  return fs.existsSync(abs) ? abs : null;
+}
+
+/**
  * Новый контекст: прокси (если включён), viewport, UA, locale, timezone + stealth.
  * @param {import('playwright').Browser} browser
+ * @param {{ wbUseSavedSession?: boolean }} [opts] — при wbUseSavedSession читать PARSER_WB_STORAGE_STATE (только wb_runner)
  */
-async function newStealthContext(browser) {
+async function newStealthContext(browser, opts = {}) {
   const viewport = pickViewport();
   const userAgent = pickUserAgent();
   const timezoneId = pickTimezone();
@@ -135,6 +152,11 @@ async function newStealthContext(browser) {
     contextOptions.proxy = proxyOpts.proxy;
   }
 
+  if (opts && opts.wbUseSavedSession) {
+    const p = resolveWbStorageStatePath(process.env.PARSER_WB_STORAGE_STATE);
+    if (p) contextOptions.storageState = p;
+  }
+
   const context = await browser.newContext(contextOptions);
 
   await context.addInitScript(STEALTH_INIT);
@@ -146,4 +168,5 @@ module.exports = {
   isProxyDisabled,
   launchBrowser,
   newStealthContext,
+  resolveWbStorageStatePath,
 };

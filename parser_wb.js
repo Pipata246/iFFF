@@ -248,7 +248,72 @@ async function parseWbListings(page) {
       return t ? t.replace(/\s+/g, ' ') : '';
     }
 
+    /**
+     * На карточке несколько сумм (старая, со скидкой, с WB Кошельком). Берём минимальную в ₽ из текста узла.
+     * Блок кошелька при авторизации — отдельные классы; сначала пробуем их.
+     */
+    function rubAmountsInText(s) {
+      const t = String(s || '').replace(/\u00a0/g, ' ');
+      const out = [];
+      const re = /(\d(?:[\d\s])*)\s*₽/g;
+      let m;
+      while ((m = re.exec(t)) !== null) {
+        const n = parseInt(m[1].replace(/\D/g, ''), 10);
+        if (Number.isFinite(n) && n >= 100 && n < 50_000_000) out.push(n);
+      }
+      return out;
+    }
+
+    function minRubInText(s) {
+      const nums = rubAmountsInText(s);
+      if (!nums.length) return null;
+      return Math.min(...nums);
+    }
+
     function pickPrice(root) {
+      const walletSelectors = [
+        '[class*="price-wallet"]',
+        '[class*="walletPrice"]',
+        '[class*="wallet-price"]',
+        '[class*="PriceWallet"]',
+        '[class*="_wallet"] [class*="price"]',
+        '[class*="wallet"] [class*="price"]',
+      ];
+      for (const sel of walletSelectors) {
+        let w = null;
+        try {
+          w = root.querySelector(sel);
+        } catch {
+          w = null;
+        }
+        if (!w) continue;
+        const t = (w.textContent || '').trim().replace(/\s+/g, ' ');
+        if (minRubInText(t) != null) return t;
+      }
+
+      let bestText = '';
+      let bestMin = Infinity;
+      let nodes;
+      try {
+        nodes = root.querySelectorAll(
+          'ins.price, ins[class*="price"], .price, [class*="product-card__price"], [class*="price"]'
+        );
+      } catch {
+        nodes = [];
+      }
+      nodes.forEach((el) => {
+        if (!(el instanceof HTMLElement)) return;
+        const t = (el.textContent || '').trim().replace(/\s+/g, ' ');
+        if (!/\d/.test(t)) return;
+        const lo = minRubInText(t);
+        if (lo == null) return;
+        if (lo < bestMin) {
+          bestMin = lo;
+          bestText = t;
+        }
+      });
+      if (bestText) return bestText;
+
       const el =
         root.querySelector('ins.price') ||
         root.querySelector('.price') ||
