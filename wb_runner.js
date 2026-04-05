@@ -558,9 +558,24 @@ async function humanBehavior(page) {
 }
 
 /**
- * Wildberries: одна «страница» поиска = бесконечная лента; крутим вниз, пока число карточек перестанет расти.
+ * При sort=priceup внизу ленты самые дорогие из уже загруженных; если все они выше maxRub — дальше дороже, скролл можно прекратить.
+ * @param {Array<{ priceNum?: number|null }>} batch — порядок как в DOM (parseWbListings)
+ * @param {number} maxRub
+ */
+function wbTailEntirelyAboveMaxPrice(batch, maxRub, tailN = 24, minPriced = 6) {
+  if (!Number.isFinite(maxRub) || maxRub <= 0) return false;
+  if (!batch || batch.length === 0) return false;
+  const tail = batch.slice(Math.max(0, batch.length - tailN));
+  const priced = tail.filter((x) => x.priceNum != null && Number.isFinite(x.priceNum));
+  if (priced.length < minPriced) return false;
+  return priced.every((x) => /** @type {number} */ (x.priceNum) > maxRub);
+}
+
+/**
+ * Wildberries: бесконечная лента; крутим вниз до стабильности счётчика карточек.
+ * При заданном maxPriceEarlyStopRub и сортировке priceup — раньше выходим, если «хвост» ленты целиком дороже максимума.
  * @param {import('playwright').Page} page
- * @param {{ maxIter?: number, stableRounds?: number }} [opts]
+ * @param {{ maxIter?: number, stableRounds?: number, maxPriceEarlyStopRub?: number|null }} [opts]
  */
 async function scrollWbFeedUntilStable(page, opts = {}) {
   const maxIter = Number.isFinite(opts.maxIter) && opts.maxIter > 0 ? Math.floor(opts.maxIter) : WB_FEED_SCROLL_MAX;
@@ -568,11 +583,24 @@ async function scrollWbFeedUntilStable(page, opts = {}) {
     Number.isFinite(opts.stableRounds) && opts.stableRounds > 0
       ? Math.floor(opts.stableRounds)
       : WB_FEED_STABLE_ROUNDS;
+  const maxRub =
+    opts.maxPriceEarlyStopRub != null &&
+    Number.isFinite(opts.maxPriceEarlyStopRub) &&
+    opts.maxPriceEarlyStopRub > 0
+      ? Math.floor(opts.maxPriceEarlyStopRub)
+      : null;
+
   let last = await page.locator(WB_ITEM_SELECTOR).count().catch(() => 0);
   let stable = 0;
-  log(
-    `  WB: догрузка ленты скроллом (без вкладок/страниц), до ${maxIter} циклов, стабильность ×${stableNeed}…`
-  );
+  if (maxRub != null) {
+    log(
+      `  WB: догрузка ленты (sort=priceup), до ${maxIter} циклов; ранний стоп, если низ ленты выше ${maxRub} ₽`
+    );
+  } else {
+    log(
+      `  WB: догрузка ленты скроллом (без вкладок/страниц), до ${maxIter} циклов, стабильность ×${stableNeed}…`
+    );
+  }
   for (let i = 0; i < maxIter; i++) {
     await page.evaluate(() => {
       const h = document.body?.scrollHeight ?? 0;
@@ -590,6 +618,18 @@ async function scrollWbFeedUntilStable(page, opts = {}) {
     if (i % 12 === 11 || i === 0) {
       log(`  WB лента: цикл ${i + 1}/${maxIter}, карточек в DOM — ${n}`);
     }
+
+    if (maxRub != null && i >= 1 && (i % 3 === 1 || i === 1)) {
+      await dismissWbOverlays(page);
+      const batch = await parseWbListings(page);
+      if (wbTailEntirelyAboveMaxPrice(batch, maxRub)) {
+        log(
+          `  WB: у нижних карточек цена выше ${maxRub} ₽ — дальше только дороже, скролл останавливаем`
+        );
+        break;
+      }
+    }
+
     if (n === last) {
       stable += 1;
       if (stable >= stableNeed) {
@@ -665,8 +705,6 @@ async function runAttemptWb(params, opts = {}) {
   const builtUrl = buildWbSearchUrl({
     query: params.query,
     extraKeywords: params.extraKeywords,
-    minPrice: params.minPrice,
-    maxPrice: params.maxPrice,
     memory: params.memory,
     color: params.color,
     page: 1,
@@ -738,7 +776,7 @@ async function runAttemptWb(params, opts = {}) {
   };
 
   try {
-    log('  сценарий WB: мягкий вход → гейт → парсинг → длинный скролл ленты (без пагинации)');
+    log('  сценарий WB: мягкий вход → гейт → парсинг → скролл ленты (sort=priceup, цена в коде)');
     // По умолчанию не ходим на главную WB: там чаще всего всплывают оверлеи/проверки,
     // из-за которых мы теряем попытки до открытия URL поиска.
     // Включить заход на главную можно флагом: WB_USE_HOME_WARMUP=1
@@ -889,10 +927,17 @@ async function runAttemptWb(params, opts = {}) {
     raw.push(...batch);
     log(`  WB собрано записей (первый проход, верх ленты): ${batch.length}`);
 
-    logStep(10, 'Скролл ленты Wildberries', 'имитация чтения и подгрузка карточек до упора');
+    logStep(
+      10,
+      'Скролл ленты Wildberries',
+      'имитация чтения и подгрузка (при заданном макс. — ранний стоп после выхода цены за диапазон)'
+    );
     await dismissWbOverlays(page);
     await humanBehavior(page);
-    await scrollWbFeedUntilStable(page);
+    await scrollWbFeedUntilStable(page, {
+      maxPriceEarlyStopRub:
+        Number.isFinite(params.maxPrice) && params.maxPrice > 0 ? params.maxPrice : null,
+    });
 
     await dismissWbOverlays(page);
     batch = await parseWbListings(page);
