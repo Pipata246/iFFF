@@ -446,7 +446,10 @@ async function gateWbListingPageReady(page, pageLabel, hooks, options = {}, flow
             logNetFailureHelp(new Error(`HTTP ${st}`));
             hooks.onIpBlock();
           }
-          if (st >= 400) {
+          // Как при первом goto: 498/502 и т.д. от прокси/CDN — не рвём сценарий, даём DOM-gate добрать карточки.
+          if (WB_NAV_SOFT_HTTP.has(st)) {
+            await waitForWbDomAfterSoftHttp(page, st);
+          } else if (st >= 400) {
             markDomGateFailedAutoClose();
             throw new Error(`Перезагрузка WB: HTTP ${st}`);
           }
