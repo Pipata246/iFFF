@@ -81,8 +81,9 @@ function parseWbMemoryGb(memoryRaw) {
 }
 
 /**
- * На WB: priceU (копейки), sort=popular, page, при памяти — f4424 + meta_charcs=true.
- * Если сайт проигнорирует часть параметров, filterWbListings всё равно подрежет по названию.
+ * На WB: sort=priceup всегда; priceU в URL не ставим (у WB баг с «левой» выдачей при пустом priceU-диапазоне).
+ * Диапазон цены отсекается после загрузки (см. filterWbListings + ранний стоп скролла в wb_runner).
+ * page, search, при памяти — f4424, при цвете — f14177449 + meta_charcs=true.
  * @param {WbSearchParams} p
  * @returns {string}
  */
@@ -93,33 +94,19 @@ function buildWbSearchUrl(p) {
 
   const pageNum = Number.isFinite(p.page) && p.page >= 1 ? Math.floor(p.page) : 1;
   u.searchParams.set('page', String(pageNum));
-  u.searchParams.set('sort', 'popular');
+  u.searchParams.set('sort', 'priceup');
   u.searchParams.set('search', fullQ);
 
-  const minRub = Number.isFinite(p.minPrice) && p.minPrice > 0 ? Math.floor(p.minPrice) : 0;
-  const maxRub = Number.isFinite(p.maxPrice) && p.maxPrice > 0 ? Math.floor(p.maxPrice) : 0;
-  if (minRub > 0 || maxRub > 0) {
-    const minK = minRub > 0 ? minRub * 100 : 0;
-    const maxK = maxRub > 0 ? maxRub * 100 : 999_999_999;
-    u.searchParams.set('priceU', `${minK};${maxK}`);
-  }
-
   const memGb = parseWbMemoryGb(p.memory || '');
-  let hasMetaCharsFacet = false;
   if (memGb != null && memGb in WB_MEMORY_GB_TO_F4424) {
-    const v = WB_MEMORY_GB_TO_F4424[memGb];
-    u.searchParams.set(WB_MEMORY_FACET_PARAM, String(v));
-    hasMetaCharsFacet = true;
+    u.searchParams.set(WB_MEMORY_FACET_PARAM, String(WB_MEMORY_GB_TO_F4424[memGb]));
   }
 
   const colorRaw = String(p.color || '').trim().toLowerCase();
   if (colorRaw && colorRaw in WB_COLOR_TO_F14177449) {
     u.searchParams.set(WB_COLOR_FACET_PARAM, String(WB_COLOR_TO_F14177449[colorRaw]));
-    hasMetaCharsFacet = true;
   }
-  if (hasMetaCharsFacet) {
-    u.searchParams.set('meta_charcs', 'true');
-  }
+  u.searchParams.set('meta_charcs', 'true');
 
   return u.href;
 }
@@ -153,6 +140,8 @@ function normalizeWbSearchUrlSingleFeed(urlStr) {
     const u = new URL(urlStr);
     if (!u.hostname.toLowerCase().includes('wildberries')) return urlStr;
     u.searchParams.set('page', '1');
+    u.searchParams.set('sort', 'priceup');
+    u.searchParams.delete('priceU');
     return u.href;
   } catch (_) {
     return urlStr;
@@ -357,11 +346,19 @@ async function parseWbListings(page) {
  * @param {number} opts.limit
  */
 function filterWbListings(items, opts) {
-  // Важно: для WB модель/память/цена/цвет задаются URL'ом (search, priceU, f4424, f14177449),
-  // поэтому на карточках их повторно НЕ фильтруем, чтобы не терять результаты.
-  // Рейтинг на WB также отключён (не фильтруем).
-
   let out = items.slice();
+
+  const minP = Number.isFinite(opts.minPrice) && opts.minPrice > 0 ? opts.minPrice : 0;
+  const maxP = Number.isFinite(opts.maxPrice) && opts.maxPrice > 0 ? opts.maxPrice : 0;
+  if (minP > 0 || maxP > 0) {
+    out = out.filter((it) => {
+      const n = it.priceNum;
+      if (n == null || !Number.isFinite(n)) return false;
+      if (minP > 0 && n < minP) return false;
+      if (maxP > 0 && n > maxP) return false;
+      return true;
+    });
+  }
 
   if (opts.limit > 0) out = out.slice(0, opts.limit);
   return out;
@@ -373,13 +370,8 @@ function filterWbListings(items, opts) {
  */
 function wbListingsFilterOpts(params) {
   return {
-    // На WB эти параметры применяются URL'ом, а не постфильтром по карточкам.
-    extraKeywords: '',
-    memory: '',
-    color: '',
-    minPrice: 0,
-    maxPrice: 0,
-    ratingMode: 'any',
+    minPrice: Number.isFinite(params.minPrice) ? params.minPrice : 0,
+    maxPrice: Number.isFinite(params.maxPrice) ? params.maxPrice : 0,
     limit: 0,
   };
 }
@@ -418,11 +410,11 @@ function buildWbSearchParamsExportRows(params) {
     { Параметр: 'Поисковый запрос', Значение: params.query || '' },
     { Параметр: 'Доп. слова (фильтр по названию)', Значение: (params.extraKeywords || '').trim() || '—' },
     {
-      Параметр: 'Мин. цена (фильтр + в URL priceU)',
+      Параметр: 'Мин. цена (постфильтр по карточке, без priceU в URL)',
       Значение: Number.isFinite(params.minPrice) && params.minPrice > 0 ? String(params.minPrice) : 'не задано',
     },
     {
-      Параметр: 'Макс. цена (фильтр + в URL priceU)',
+      Параметр: 'Макс. цена (постфильтр по карточке, без priceU в URL)',
       Значение: Number.isFinite(params.maxPrice) && params.maxPrice > 0 ? String(params.maxPrice) : 'не задано',
     },
     {

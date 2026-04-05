@@ -558,21 +558,56 @@ async function humanBehavior(page) {
 }
 
 /**
- * Wildberries: одна «страница» поиска = бесконечная лента; крутим вниз, пока число карточек перестанет расти.
- * @param {import('playwright').Page} page
- * @param {{ maxIter?: number, stableRounds?: number }} [opts]
+ * @param {string} href
+ * @returns {string}
  */
-async function scrollWbFeedUntilStable(page, opts = {}) {
-  const maxIter = Number.isFinite(opts.maxIter) && opts.maxIter > 0 ? Math.floor(opts.maxIter) : WB_FEED_SCROLL_MAX;
-  const stableNeed =
-    Number.isFinite(opts.stableRounds) && opts.stableRounds > 0
-      ? Math.floor(opts.stableRounds)
-      : WB_FEED_STABLE_ROUNDS;
+function wbHrefDedupeKey(href) {
+  if (!href) return '';
+  try {
+    const u = new URL(href);
+    return `${u.origin}${u.pathname}`;
+  } catch (_) {
+    return href.split('?')[0].replace(/#.*$/, '');
+  }
+}
+
+/**
+ * @param {Array<object>} raw
+ * @param {Set<string>} hrefSeen
+ * @param {Array<object>} batch
+ */
+function mergeWbParseBatch(raw, hrefSeen, batch) {
+  for (const it of batch) {
+    const k = wbHrefDedupeKey(it.href);
+    if (!k || hrefSeen.has(k)) continue;
+    hrefSeen.add(k);
+    raw.push(it);
+  }
+}
+
+/**
+ * Лента WB при sort=priceup: новые подгружаемые карточки не дешевле уже увиденных;
+ * если задан maxPrice и все *новые* карточки с известной ценой дороже max — дальше скроллить бессмысленно.
+ * @param {import('playwright').Page} page
+ * @param {object} params
+ * @param {Array<object>} raw
+ * @param {Set<string>} hrefSeen
+ */
+async function scrollWbFeedWithPriceEarlyStop(page, params, raw, hrefSeen) {
+  const maxRub = Number.isFinite(params.maxPrice) && params.maxPrice > 0 ? params.maxPrice : 0;
+  const usePriceStop = maxRub > 0;
+
+  const maxIter = WB_FEED_SCROLL_MAX;
+  const stableNeed = WB_FEED_STABLE_ROUNDS;
   let last = await page.locator(WB_ITEM_SELECTOR).count().catch(() => 0);
   let stable = 0;
+
   log(
-    `  WB: догрузка ленты скроллом (без вкладок/страниц), до ${maxIter} циклов, стабильность ×${stableNeed}…`
+    usePriceStop
+      ? `  WB: догрузка ленты (sort=priceup); если пачка новых карточек с ценой — все дороже ${maxRub} ₽, останавливаем скролл.`
+      : `  WB: догрузка ленты скроллом, до ${maxIter} циклов, стабильность ×${stableNeed}…`
   );
+
   for (let i = 0; i < maxIter; i++) {
     await page.evaluate(() => {
       const h = document.body?.scrollHeight ?? 0;
@@ -586,6 +621,23 @@ async function scrollWbFeedUntilStable(page, opts = {}) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await randomDelay(2200, 4500);
     }
+
+    const keysBefore = new Set(hrefSeen);
+    const batch = await parseWbListings(page);
+    const newlyAdded = batch.filter((it) => {
+      const k = wbHrefDedupeKey(it.href);
+      return k && !keysBefore.has(k);
+    });
+    mergeWbParseBatch(raw, hrefSeen, batch);
+
+    if (usePriceStop && newlyAdded.length > 0) {
+      const priced = newlyAdded.filter((it) => it.priceNum != null && Number.isFinite(it.priceNum));
+      if (priced.length > 0 && priced.every((it) => it.priceNum > maxRub)) {
+        log(`  WB: стоп скролла — все новые карточки с ценой дороже ${maxRub} ₽ (${priced.length} шт.).`);
+        break;
+      }
+    }
+
     const n = await page.locator(WB_ITEM_SELECTOR).count().catch(() => 0);
     if (i % 12 === 11 || i === 0) {
       log(`  WB лента: цикл ${i + 1}/${maxIter}, карточек в DOM — ${n}`);
@@ -603,6 +655,7 @@ async function scrollWbFeedUntilStable(page, opts = {}) {
       last = n;
     }
   }
+
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
   await randomDelay(4000, 7500);
   const finalN = await page.locator(WB_ITEM_SELECTOR).count().catch(() => 0);
@@ -884,19 +937,24 @@ async function runAttemptWb(params, opts = {}) {
     log('  пауза перед сбором данных с выдачи WB (осторожный осмотр страницы, как на Avito)…');
     await randomDelay(SOFT.afterListingGateMin, SOFT.afterListingGateMax);
     await dismissWbOverlays(page);
-    let raw = [];
+    const hrefSeen = new Set();
+    const raw = [];
     let batch = await parseWbListings(page);
-    raw.push(...batch);
+    mergeWbParseBatch(raw, hrefSeen, batch);
     log(`  WB собрано записей (первый проход, верх ленты): ${batch.length}`);
 
-    logStep(10, 'Скролл ленты Wildberries', 'имитация чтения и подгрузка карточек до упора');
+    logStep(
+      10,
+      'Скролл ленты Wildberries',
+      'имитация чтения и подгрузка (sort=priceup; при заданной max цене — ранний стоп)'
+    );
     await dismissWbOverlays(page);
     await humanBehavior(page);
-    await scrollWbFeedUntilStable(page);
+    await scrollWbFeedWithPriceEarlyStop(page, params, raw, hrefSeen);
 
     await dismissWbOverlays(page);
     batch = await parseWbListings(page);
-    raw.push(...batch);
+    mergeWbParseBatch(raw, hrefSeen, batch);
     raw = dedupeByHref(raw);
     log(`  WB после полного скролла ленты, уникальных: ${raw.length}`);
 
