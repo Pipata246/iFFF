@@ -6,6 +6,37 @@
 const { parsePriceNumber } = require('./utils');
 
 /**
+ * Число для filterWbListings: при двух ценах в одной строке (витрина + WB Кошелёк) нужна **минимальная** сумма.
+ * parsePriceNumber склеивает все цифры подряд → получается гигантское число → всё отсекается по maxPrice и в Excel 0 строк.
+ * @param {string} priceText
+ * @returns {number|null}
+ */
+function parseWbPriceNumberForFilter(priceText) {
+  const t = String(priceText || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t) return null;
+  const amounts = [];
+  const withRub = /(\d(?:[\d\s])*)\s*(?:₽|руб\.?)(?!\w)/gi;
+  let m;
+  while ((m = withRub.exec(t)) !== null) {
+    const n = parseInt(m[1].replace(/\D/g, ''), 10);
+    if (Number.isFinite(n) && n >= 500 && n < 50_000_000) amounts.push(n);
+  }
+  if (amounts.length > 0) return Math.min(...amounts);
+  const spaced = t.match(/\d{1,3}(?:\s\d{3})+/g) || [];
+  for (const frag of spaced) {
+    const n = parseInt(frag.replace(/\D/g, ''), 10);
+    if (Number.isFinite(n) && n >= 3_000 && n < 50_000_000) amounts.push(n);
+  }
+  if (amounts.length > 0) return Math.min(...amounts);
+  const fallback = parsePriceNumber(t);
+  if (fallback != null && fallback >= 500 && fallback < 10_000_000) return fallback;
+  return null;
+}
+
+/**
  * @typedef {Object} WbSearchParams
  * @property {string} query
  * @property {string} [extraKeywords]
@@ -401,7 +432,7 @@ async function parseWbListings(page) {
 
   return items.map((it) => ({
     ...it,
-    priceNum: parsePriceNumber(it.priceText),
+    priceNum: parseWbPriceNumberForFilter(it.priceText),
   }));
 }
 
