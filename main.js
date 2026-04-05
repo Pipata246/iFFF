@@ -797,10 +797,7 @@ async function collectParams() {
       city = await ask(rl, 'Город Avito (например Москва или moskva): ');
     }
 
-    const minPriceStr = await ask(
-      rl,
-      'Цена от, руб. (0 = не важно; на WB без priceU в ссылке — отбор по цене на карточке после sort=priceup): '
-    );
+    const minPriceStr = await ask(rl, 'Цена от, руб. (0 = не важно; для WB также в ссылке priceU): ');
     const maxPriceStr = await ask(rl, 'Цена до, руб. (0 = не важно): ');
     const memory = await ask(rl, 'Память, ГБ (например 256), пусто = любая: ');
 
