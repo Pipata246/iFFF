@@ -31,6 +31,9 @@ function loadDotEnvIfPresent() {
 
 loadDotEnvIfPresent();
 
+/** Корень проекта (нужен до warnIfWbStorageFileWithoutEnv — там ранний вызов при загрузке модуля). */
+const PROJECT_DIR = __dirname;
+
 /** Файл сессии WB лежит в проекте, а в .env не прописан путь — парсер не подставит его сам. */
 function warnIfWbStorageFileWithoutEnv() {
   const wbJson = path.join(PROJECT_DIR, 'wb_storage.json');
@@ -54,7 +57,6 @@ const TG_API = `https://api.telegram.org/bot${token}`;
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 
-const PROJECT_DIR = __dirname; // telegram_bot.js лежит в корне проекта
 const XLSX_GLOB_PREFIX = 'results_';
 const XLSX_GLOB_SUFFIX = '.xlsx';
 
