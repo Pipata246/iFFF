@@ -13,12 +13,12 @@ const { parsePriceNumber } = require('./utils');
  */
 function parseWbPriceNumberForFilter(priceText) {
   const t = String(priceText || '')
-    .replace(/\u00a0/g, ' ')
+    .replace(/\u00a0|\u2009|\u202f|\u2007/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
   if (!t) return null;
   const amounts = [];
-  const withRub = /(\d(?:[\d\s])*)\s*(?:₽|руб\.?)(?!\w)/gi;
+  const withRub = /(\d(?:[\d\s])*)\s*(?:₽|руб\.?|RUB)(?!\w)/gi;
   let m;
   while ((m = withRub.exec(t)) !== null) {
     const n = parseInt(m[1].replace(/\D/g, ''), 10);
@@ -29,6 +29,12 @@ function parseWbPriceNumberForFilter(priceText) {
   for (const frag of spaced) {
     const n = parseInt(frag.replace(/\D/g, ''), 10);
     if (Number.isFinite(n) && n >= 3_000 && n < 50_000_000) amounts.push(n);
+  }
+  if (amounts.length > 0) return Math.min(...amounts);
+  const compact = t.match(/\b\d{5,7}\b/g) || [];
+  for (const frag of compact) {
+    const n = parseInt(frag, 10);
+    if (Number.isFinite(n) && n >= 8_000 && n < 50_000_000) amounts.push(n);
   }
   if (amounts.length > 0) return Math.min(...amounts);
   const fallback = parsePriceNumber(t);
@@ -280,17 +286,36 @@ async function parseWbListings(page) {
     }
 
     /**
-     * На карточке несколько сумм (старая, со скидкой, с WB Кошельком). Берём минимальную в ₽ из текста узла.
-     * Блок кошелька при авторизации — отдельные классы; сначала пробуем их.
+     * На карточке несколько сумм (старая, со скидкой, с WB Кошельком). Берём минимальную.
+     * На WB часто нет символа ₽ в том же textNode — тогда ищем группы «102 032» / «102032».
      */
+    function normalizeMoneySpaces(s) {
+      return String(s || '')
+        .replace(/\u00a0|\u2009|\u202f|\u2007/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
     function rubAmountsInText(s) {
-      const t = String(s || '').replace(/\u00a0/g, ' ');
+      const t = normalizeMoneySpaces(s);
       const out = [];
-      const re = /(\d(?:[\d\s])*)\s*₽/g;
+      const reStrict = /(\d(?:[\d\s])*)\s*(?:₽|руб\.?|RUB)\b/gi;
       let m;
-      while ((m = re.exec(t)) !== null) {
+      while ((m = reStrict.exec(t)) !== null) {
         const n = parseInt(m[1].replace(/\D/g, ''), 10);
         if (Number.isFinite(n) && n >= 100 && n < 50_000_000) out.push(n);
+      }
+      if (out.length) return out;
+      const spaced = t.match(/\d{1,3}(?:\s\d{3})+/g) || [];
+      for (const frag of spaced) {
+        const n = parseInt(frag.replace(/\D/g, ''), 10);
+        if (Number.isFinite(n) && n >= 3_000 && n < 50_000_000) out.push(n);
+      }
+      if (out.length) return out;
+      const compact = t.match(/\b\d{5,7}\b/g) || [];
+      for (const frag of compact) {
+        const n = parseInt(frag, 10);
+        if (Number.isFinite(n) && n >= 8_000 && n < 50_000_000) out.push(n);
       }
       return out;
     }
@@ -307,6 +332,8 @@ async function parseWbListings(page) {
         '[class*="walletPrice"]',
         '[class*="wallet-price"]',
         '[class*="PriceWallet"]',
+        '[class*="lowerPrice"]',
+        '[class*="price--"]',
         '[class*="_wallet"] [class*="price"]',
         '[class*="wallet"] [class*="price"]',
       ];
@@ -318,7 +345,7 @@ async function parseWbListings(page) {
           w = null;
         }
         if (!w) continue;
-        const t = (w.textContent || '').trim().replace(/\s+/g, ' ');
+        const t = normalizeMoneySpaces(w.textContent || '');
         if (minRubInText(t) != null) return t;
       }
 
@@ -334,7 +361,7 @@ async function parseWbListings(page) {
       }
       nodes.forEach((el) => {
         if (!(el instanceof HTMLElement)) return;
-        const t = (el.textContent || '').trim().replace(/\s+/g, ' ');
+        const t = normalizeMoneySpaces(el.textContent || '');
         if (!/\d/.test(t)) return;
         const lo = minRubInText(t);
         if (lo == null) return;
@@ -350,7 +377,7 @@ async function parseWbListings(page) {
         root.querySelector('.price') ||
         root.querySelector('[class*="price"]') ||
         root.querySelector('[class*="product-card__price"]');
-      return el ? (el.textContent || '').trim().replace(/\s+/g, ' ') : '';
+      return el ? normalizeMoneySpaces(el.textContent || '') : '';
     }
 
     function pickMemoryFromText(text) {
