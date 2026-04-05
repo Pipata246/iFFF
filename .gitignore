@@ -3,6 +3,11 @@ node_modules/
 # secrets
 .env
 .env.*
+!.env.vps.example
+
+# WB Playwright session (cookies — не коммитить)
+wb_storage.json
+.wb_snap_*.json
 
 # results
 results_*.xlsx

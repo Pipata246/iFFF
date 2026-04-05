@@ -31,6 +31,19 @@ function loadDotEnvIfPresent() {
 
 loadDotEnvIfPresent();
 
+/** Файл сессии WB лежит в проекте, а в .env не прописан путь — парсер не подставит его сам. */
+function warnIfWbStorageFileWithoutEnv() {
+  const wbJson = path.join(PROJECT_DIR, 'wb_storage.json');
+  if (String(process.env.PARSER_WB_STORAGE_STATE || '').trim()) return;
+  if (!fs.existsSync(wbJson)) return;
+  const abs = path.resolve(wbJson);
+  console.warn(
+    `[ifind] Найден ${abs}, но PARSER_WB_STORAGE_STATE не задан (пустой или закомментирован в .env). ` +
+      `Добавьте строку без #: PARSER_WB_STORAGE_STATE=${abs} и systemctl restart ifind-bot`
+  );
+}
+warnIfWbStorageFileWithoutEnv();
+
 const token = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN;
 if (!token) {
   console.error('Ошибка: не задан TELEGRAM_BOT_TOKEN (или BOT_TOKEN).');
