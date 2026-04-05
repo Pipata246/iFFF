@@ -326,7 +326,78 @@ async function parseWbListings(page) {
       return Math.min(...nums);
     }
 
+    /**
+     * WB в data-атрибутах и JSON кладёт суммы в копейках (priceU). Если число не кратно 100 — считаем уже рублями.
+     */
+    function wbKopecksOrRubToRub(raw) {
+      const n = parseInt(String(raw).replace(/\D/g, ''), 10);
+      if (!Number.isFinite(n) || n < 50) return null;
+      if (n % 100 === 0) return Math.round(n / 100);
+      return n;
+    }
+
+    function addRubFieldsFromAttrString(str, bucket) {
+      if (!str || str.length < 12 || str.length > 400000 || !/\d/.test(str)) return;
+      if (!/price|sale|wallet|basic|product/i.test(str)) return;
+      const re =
+        /"(?:salePriceU|priceU|basicPriceU|productPriceU|totalPriceU|walletPriceU|priceWithSaleU)"\s*:\s*(\d+)/gi;
+      let m;
+      while ((m = re.exec(str)) !== null) {
+        const rub = wbKopecksOrRubToRub(m[1]);
+        if (rub != null && rub >= 500 && rub < 50_000_000) bucket.add(rub);
+      }
+    }
+
+    function collectRubFromEmbeddedJson(root, bucket) {
+      const walk = (el) => {
+        if (!(el instanceof HTMLElement)) return;
+        const attrs = el.attributes;
+        if (attrs && attrs.length) {
+          for (let i = 0; i < attrs.length; i++) {
+            addRubFieldsFromAttrString(attrs[i].value, bucket);
+          }
+        }
+        for (const c of el.children) walk(c);
+      };
+      walk(root);
+    }
+
+    function pickNmId(root, href) {
+      const d0 = root.getAttribute('data-nm-id');
+      if (d0 && /^\d{5,20}$/.test(String(d0).trim())) return String(d0).trim();
+      const inner = root.querySelector('[data-nm-id]');
+      if (inner) {
+        const d1 = inner.getAttribute('data-nm-id');
+        if (d1 && /^\d{5,20}$/.test(String(d1).trim())) return String(d1).trim();
+      }
+      try {
+        const u = new URL(href, base);
+        const m = u.pathname.match(/\/catalog\/(\d{5,20})\/detail/i);
+        if (m) return m[1];
+      } catch {
+        /* ignore */
+      }
+      return '';
+    }
+
+    /**
+     * Собираем все разумные суммы по карточке и берём минимум (витрина / скидка / кошелёк часто в разных узлах и JSON).
+     */
     function pickPrice(root) {
+      const rubs = new Set();
+
+      function addRub(n) {
+        if (n == null || !Number.isFinite(n)) return;
+        const x = Math.round(n);
+        if (x < 500 || x >= 50_000_000) return;
+        rubs.add(x);
+      }
+
+      function addFromText(t) {
+        const lo = minRubInText(normalizeMoneySpaces(t));
+        if (lo != null) addRub(lo);
+      }
+
       const walletSelectors = [
         '[class*="price-wallet"]',
         '[class*="walletPrice"]',
@@ -334,6 +405,7 @@ async function parseWbListings(page) {
         '[class*="PriceWallet"]',
         '[class*="lowerPrice"]',
         '[class*="price--"]',
+        '[class*="c-price"]',
         '[class*="_wallet"] [class*="price"]',
         '[class*="wallet"] [class*="price"]',
       ];
@@ -345,12 +417,9 @@ async function parseWbListings(page) {
           w = null;
         }
         if (!w) continue;
-        const t = normalizeMoneySpaces(w.textContent || '');
-        if (minRubInText(t) != null) return t;
+        addFromText(w.textContent || '');
       }
 
-      let bestText = '';
-      let bestMin = Infinity;
       let nodes;
       try {
         nodes = root.querySelectorAll(
@@ -361,16 +430,26 @@ async function parseWbListings(page) {
       }
       nodes.forEach((el) => {
         if (!(el instanceof HTMLElement)) return;
-        const t = normalizeMoneySpaces(el.textContent || '');
-        if (!/\d/.test(t)) return;
-        const lo = minRubInText(t);
-        if (lo == null) return;
-        if (lo < bestMin) {
-          bestMin = lo;
-          bestText = t;
-        }
+        addFromText(el.textContent || '');
       });
-      if (bestText) return bestText;
+
+      collectRubFromEmbeddedJson(root, rubs);
+
+      try {
+        root.querySelectorAll('[aria-label], [title]').forEach((el) => {
+          addFromText(el.getAttribute('aria-label') || '');
+          addFromText(el.getAttribute('title') || '');
+        });
+      } catch {
+        /* ignore */
+      }
+
+      addFromText(root.innerText || '');
+
+      if (rubs.size > 0) {
+        const best = Math.min(...rubs);
+        return `${best} ₽`;
+      }
 
       const el =
         root.querySelector('ins.price') ||
@@ -429,6 +508,7 @@ async function parseWbListings(page) {
 
       const title = pickTitle(root, mainA);
       const priceText = pickPrice(root);
+      const nmId = pickNmId(root, href);
       const specs = pickSpecsBlock(root);
       const blockText = (root.textContent || '').replace(/\s+/g, ' ');
       // На WB память может встречаться не только в title/specs, поэтому ищем по всему тексту карточки.
@@ -439,6 +519,7 @@ async function parseWbListings(page) {
       out.push({
         title,
         priceText,
+        nmId,
         href,
         city: '—',
         memoryLabel,

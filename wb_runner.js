@@ -969,8 +969,21 @@ async function runAttemptWb(params, opts = {}) {
     );
 
     raw = dedupeByHref(raw);
-    const filtered = filterWbListings(raw, wbListingsFilterOpts(params));
+    const wbFilt = wbListingsFilterOpts(params);
+    const filtered = filterWbListings(raw, wbFilt);
     log(`  WB итого после фильтров: ${filtered.length}`);
+    if (filtered.length === 0 && raw.length > 0) {
+      const sample = raw
+        .slice(0, 5)
+        .map(
+          (r) =>
+            `nm=${r.nmId || '?'} "${String(r.priceText || '').slice(0, 36)}"→${r.priceNum != null ? r.priceNum : 'null'}`
+        )
+        .join('; ');
+      log(
+        `  WB: диагностика пустого листа — фильтр цены ${wbFilt.minPrice || 0}…${wbFilt.maxPrice || 0} ₽; примеры: ${sample}`
+      );
+    }
     resumeListingUrlWb = null;
     resumeSerpPageIndexWb = null;
     return filtered;
