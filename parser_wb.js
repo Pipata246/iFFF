@@ -3,11 +3,10 @@
  * Вёрстка WB часто меняется — селекторы с запасными вариантами внутри page.evaluate.
  */
 
-const { parsePriceNumber } = require('./utils');
-
 /**
- * Число для filterWbListings: при двух ценах в одной строке (витрина + WB Кошелёк) нужна **минимальная** сумма.
- * parsePriceNumber склеивает все цифры подряд → получается гигантское число → всё отсекается по maxPrice и в Excel 0 строк.
+ * Число для filterWbListings: из строки цены WB собираем все похожие на рубли суммы и берём минимум
+ * (витрина + «с кошельком» в одной строке, напр. «12 999 ₽ 10 499 ₽ с кошельком» → 10499).
+ * parsePriceNumber из utils для WB не используем — она склеивает все цифры в одно число.
  * @param {string} priceText
  * @returns {number|null}
  */
@@ -17,29 +16,31 @@ function parseWbPriceNumberForFilter(priceText) {
     .replace(/\s+/g, ' ')
     .trim();
   if (!t) return null;
+
   const amounts = [];
+
+  function push(n) {
+    if (Number.isFinite(n) && n >= 500 && n < 50_000_000) amounts.push(n);
+  }
+
   const withRub = /(\d(?:[\d\s])*)\s*(?:₽|руб\.?|RUB)(?!\w)/gi;
   let m;
   while ((m = withRub.exec(t)) !== null) {
-    const n = parseInt(m[1].replace(/\D/g, ''), 10);
-    if (Number.isFinite(n) && n >= 500 && n < 50_000_000) amounts.push(n);
+    push(parseInt(m[1].replace(/\D/g, ''), 10));
   }
-  if (amounts.length > 0) return Math.min(...amounts);
+
   const spaced = t.match(/\d{1,3}(?:\s\d{3})+/g) || [];
   for (const frag of spaced) {
-    const n = parseInt(frag.replace(/\D/g, ''), 10);
-    if (Number.isFinite(n) && n >= 3_000 && n < 50_000_000) amounts.push(n);
+    push(parseInt(frag.replace(/\D/g, ''), 10));
   }
-  if (amounts.length > 0) return Math.min(...amounts);
-  const compact = t.match(/\b\d{5,7}\b/g) || [];
+
+  const compact = t.match(/\b\d{5,8}\b/g) || [];
   for (const frag of compact) {
-    const n = parseInt(frag, 10);
-    if (Number.isFinite(n) && n >= 8_000 && n < 50_000_000) amounts.push(n);
+    push(parseInt(frag, 10));
   }
-  if (amounts.length > 0) return Math.min(...amounts);
-  const fallback = parsePriceNumber(t);
-  if (fallback != null && fallback >= 500 && fallback < 10_000_000) return fallback;
-  return null;
+
+  if (amounts.length === 0) return null;
+  return Math.min(...amounts);
 }
 
 /**
@@ -558,11 +559,15 @@ function filterWbListings(items, opts) {
   const minP = opts.minPrice > 0 ? opts.minPrice : 0;
   const maxP = opts.maxPrice > 0 ? opts.maxPrice : 0;
   if (minP > 0 || maxP > 0) {
+    for (const it of out) {
+      const price = it.priceNum;
+      console.log('WB PRICE PARSE:', it.priceText, '=>', price);
+    }
     out = out.filter((it) => {
-      const p = it.priceNum;
-      if (p == null || !Number.isFinite(p)) return false;
-      if (minP > 0 && p < minP) return false;
-      if (maxP > 0 && p > maxP) return false;
+      const price = it.priceNum;
+      if (price == null || !Number.isFinite(price)) return false;
+      if (minP > 0 && price < minP) return false;
+      if (maxP > 0 && price > maxP) return false;
       return true;
     });
   }
@@ -640,6 +645,7 @@ function buildWbSearchParamsExportRows(params) {
 
 module.exports = {
   buildWbSearchUrl,
+  parseWbPriceNumberForFilter,
   parseWbMemoryGb,
   WB_MEMORY_FACET_PARAM,
   WB_MEMORY_GB_TO_F4424,
