@@ -299,6 +299,7 @@ async function wbWarmHumanPresence(page) {
 async function dismissWbOverlays(page) {
   const clicked = await page.evaluate(() => {
     let n = 0;
+    const seen = new WeakSet();
     const selectors = [
       '[class*="modal"] [aria-label*="закры" i]',
       '[class*="modal"] [aria-label*="close" i]',
@@ -311,15 +312,38 @@ async function dismissWbOverlays(page) {
       '[class*="cookies"] button',
       '[class*="banner"] [aria-label*="закры" i]',
     ];
+    /** Не нажимать «купить / корзина / избранное» — парсер только читает выдачу. */
+    const looksLikePurchaseOrCart = /корзин|в\s*корз|купить|заказать|оформить|избранн|в\s*избранн|добавить/i;
+    /** Для блоков cookie раньше кликали любую кнопку — мог сработать «В корзину» внутри общего контейнера. */
+    const looksLikeCookieConsent =
+      /закры|close|accept|allow|^\s*ok\s*$|^\s*ок\s*$|принять|принимаю|понятно|согласен|согласна|отклон|только\s+необходим|все\s+файлы|все\s+cookie/i;
+    const looksLikeCloseOnly = /закры|close/;
     for (const sel of selectors) {
       document.querySelectorAll(sel).forEach((el) => {
         if (!(el instanceof HTMLElement)) return;
-        const txt = (el.textContent || '').toLowerCase();
-        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-        if (sel.includes('cookie') || /закры|close|ok|ок|принять|понятно/.test(`${txt} ${aria}`)) {
-          el.click();
-          n += 1;
+        if (el.id === 'onetrust-accept-btn-handler') {
+          if (!seen.has(el)) {
+            seen.add(el);
+            el.click();
+            n += 1;
+          }
+          return;
         }
+        const txt = (el.textContent || '').trim().toLowerCase();
+        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+        const hay = `${txt} ${aria}`;
+        if (looksLikePurchaseOrCart.test(hay)) return;
+        const isCookieScope =
+          sel.includes('cookie') || sel.includes('onetrust') || sel === '#onetrust-accept-btn-handler';
+        if (isCookieScope) {
+          if (!looksLikeCookieConsent.test(hay)) return;
+        } else if (!looksLikeCloseOnly.test(hay)) {
+          return;
+        }
+        if (seen.has(el)) return;
+        seen.add(el);
+        el.click();
+        n += 1;
       });
     }
     return n;
